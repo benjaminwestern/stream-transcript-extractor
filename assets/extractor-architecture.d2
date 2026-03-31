@@ -1,0 +1,116 @@
+direction: right
+
+classes: {
+  container: {
+    style.fill: "#F8FAFC"
+    style.stroke: "#465669"
+    style.stroke-width: 1
+  }
+
+  control: {
+    style.fill: "#E0F2FE"
+    style.stroke: "#1D4ED8"
+    style.stroke-width: 1
+    style.font-color: "#0F172A"
+  }
+
+  runtime: {
+    style.fill: "#DBEAFE"
+    style.stroke: "#2563EB"
+    style.stroke-width: 1
+    style.font-color: "#0F172A"
+  }
+
+  extraction: {
+    style.fill: "#EDE9FE"
+    style.stroke: "#7C3AED"
+    style.stroke-width: 1
+    style.font-color: "#0F172A"
+  }
+
+  browser: {
+    style.fill: "#DCFCE7"
+    style.stroke: "#16A34A"
+    style.stroke-width: 1
+    style.font-color: "#0F172A"
+  }
+
+  output: {
+    style.fill: "#FEF3C7"
+    style.stroke: "#D97706"
+    style.stroke-width: 1
+    style.font-color: "#0F172A"
+  }
+}
+
+UserMachine: {
+  label: "User machine"
+  class: container
+
+  ExtractorApp: {
+    label: "Extractor"
+    class: container
+
+    Cli: {
+      label: "CLI prompts\nand flags"
+      class: control
+    }
+
+    BrowserOps: {
+      label: "Browser discovery\nand launch"
+      class: runtime
+    }
+
+    Cdp: {
+      label: "Minimal CDP client"
+      class: runtime
+    }
+
+    NetworkPath: {
+      label: "Network payload\nextraction"
+      class: extraction
+    }
+
+    DomPath: {
+      label: "DOM fallback\nextraction"
+      class: extraction
+    }
+
+    Writer: {
+      label: "JSON, Markdown,\nand debug writers"
+      class: output
+    }
+  }
+
+  BrowserContext: {
+    label: "Browser context"
+    class: container
+
+    Profile: {
+      label: "Real Chrome or\nEdge profile"
+      class: browser
+    }
+
+    Stream: {
+      label: "Microsoft Stream\nrecording page"
+      class: browser
+    }
+  }
+
+  Files: {
+    label: "./output/*"
+    class: output
+    shape: document
+  }
+}
+
+UserMachine.ExtractorApp.Cli -> UserMachine.ExtractorApp.BrowserOps: "browser, profile, format, mode"
+UserMachine.ExtractorApp.BrowserOps -> UserMachine.ExtractorApp.Cdp: "attach to remote debug port"
+UserMachine.ExtractorApp.BrowserOps -> UserMachine.BrowserContext.Profile: "relaunch signed-in profile"
+UserMachine.BrowserContext.Profile -> UserMachine.BrowserContext.Stream: "open authenticated session"
+UserMachine.ExtractorApp.Cdp -> UserMachine.BrowserContext.Stream: "commands, events, and page state"
+UserMachine.ExtractorApp.Cdp -> UserMachine.ExtractorApp.NetworkPath: "response bodies and metadata"
+UserMachine.ExtractorApp.Cdp -> UserMachine.ExtractorApp.DomPath: "page evaluation and scrolling"
+UserMachine.ExtractorApp.NetworkPath -> UserMachine.ExtractorApp.Writer: "payload transcript + meeting metadata"
+UserMachine.ExtractorApp.DomPath -> UserMachine.ExtractorApp.Writer: "rendered transcript entries"
+UserMachine.ExtractorApp.Writer -> UserMachine.Files: "write JSON, Markdown, and diagnostics"
