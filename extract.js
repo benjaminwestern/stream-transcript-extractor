@@ -2261,6 +2261,7 @@ const runEmbeddedNetworkMode = (() => {
   const DEFAULT_AUTOMATIC_PANEL_OPEN_TIMEOUT_MS = 7_500;
   const DEFAULT_AUTOMATIC_SIGNAL_TIMEOUT_MS = 8_000;
   const DEFAULT_AUTOMATIC_SIGNAL_RETRY_TIMEOUT_MS = 6_000;
+  const DEFAULT_AUTOMATIC_FINAL_REOPEN_SIGNAL_TIMEOUT_MS = 10_000;
   const DEFAULT_AUTOMATIC_REQUEST_SETTLE_TIMEOUT_MS = 8_000;
   const DEFAULT_AUTOMATIC_CLICK_SETTLE_MS = 750;
   const MAX_TRACKED_RESPONSES = 150;
@@ -4857,12 +4858,53 @@ const runEmbeddedNetworkMode = (() => {
     console.log('\nAutomatic mode needs a manual assist. Capture is still armed.');
     console.log(
       reason === 'panel-open-failed'
-        ? '1. In Stream, refresh the page if needed, then open or reopen the Transcript panel.'
+        ? '1. In Stream, open or reopen the Transcript panel, then scroll once if the app lazily fetches chunks.'
         : '1. In Stream, close and reopen the Transcript panel, then scroll once if the app lazily fetches chunks.',
     );
     console.log(
-      '2. Let the transcript finish loading. If this terminal reports transcript traffic first, you can press Enter as soon as the panel looks ready.',
+      '2. Let the transcript finish loading, watch this terminal for transcript traffic, then press Enter.',
     );
+  }
+
+  function printNextExtractionInstructions(captureControl = 'manual') {
+    console.log('\nStart another extraction');
+    console.log(
+      '1. Open the next Microsoft Stream meeting in a new tab in the existing browser window.',
+    );
+    if (captureControl === 'automatic') {
+      console.log('2. Wait for the page to finish rendering.');
+    } else {
+      console.log('2. Leave the Transcript panel closed for now.');
+    }
+    console.log(
+      '3. Return here and press Enter to reuse the same temporary profile, or type "done" to finish.',
+    );
+  }
+
+  async function promptForNextExtraction(prompt, captureControl = 'manual') {
+    printNextExtractionInstructions(captureControl);
+
+    while (true) {
+      const answer = (await prompt.ask('\nPress Enter to start another extraction, or type "done": '))
+        .trim()
+        .toLowerCase();
+      if (!answer) {
+        return true;
+      }
+
+      if (
+        answer === 'done' ||
+        answer === 'd' ||
+        answer === 'no' ||
+        answer === 'n' ||
+        answer === 'quit' ||
+        answer === 'exit'
+      ) {
+        return false;
+      }
+
+      console.log('Press Enter to continue, or type "done" to finish.');
+    }
   }
 
   function buildTranscriptPanelAutomationExpression(action = 'inspect') {
@@ -5673,6 +5715,50 @@ const runEmbeddedNetworkMode = (() => {
         transcriptSignal = await waitForTranscriptSignal(
           captureFeedback,
           DEFAULT_AUTOMATIC_SIGNAL_RETRY_TIMEOUT_MS,
+        );
+      }
+    }
+
+    if (!transcriptSignal) {
+      console.log(
+        'Automatic mode: still no transcript traffic. Trying one final automatic reopen-and-scroll pass.',
+      );
+      logAutomaticAction(
+        captureFeedback,
+        debugEnabled,
+        'final automatic reopen-and-scroll pass',
+      );
+      panelResult = await ensureTranscriptPanelOpenAutomatically(
+        cdp,
+        captureFeedback,
+        debugEnabled,
+        {
+          refreshIfOpen: true,
+        },
+      );
+      logAutomaticAction(
+        captureFeedback,
+        debugEnabled,
+        'final automatic reopen-and-scroll result',
+        {
+          opened: panelResult.opened,
+          refreshed: panelResult.refreshed,
+          controlLabel: panelResult.controlLabel || '',
+          state: summarizeTranscriptPanelUiState(panelResult.state),
+        },
+      );
+      if (panelResult.opened) {
+        await sleep(DEFAULT_AUTOMATIC_CLICK_SETTLE_MS);
+        if (
+          await nudgeTranscriptPanelAutomatically(cdp, captureFeedback, debugEnabled)
+        ) {
+          console.log(
+            'Automatic mode: scrolled the Transcript panel after the final reopen.',
+          );
+        }
+        transcriptSignal = await waitForTranscriptSignal(
+          captureFeedback,
+          DEFAULT_AUTOMATIC_FINAL_REOPEN_SIGNAL_TIMEOUT_MS,
         );
       }
     }
@@ -6861,6 +6947,8 @@ const runEmbeddedNetworkMode = (() => {
     let profile = null;
     let debugPort = null;
     let targetPage = null;
+    let shouldContinue = true;
+    let hasCompletedExtraction = false;
   
     try {
       ({ browser, profile } = await selectBrowserAndProfile(options, prompt));
@@ -6881,74 +6969,107 @@ const runEmbeddedNetworkMode = (() => {
       console.log('Waiting for the browser debug endpoint...');
       await waitForBrowserDebugEndpoint(debugPort);
       await waitForBrowserPageTarget(debugPort);
-  
-      printInitialRunInstructions(captureControl);
-      await prompt.waitForEnter(
-        captureControl === 'automatic'
-          ? '\nPress Enter once the Stream meeting page is open and fully rendered...\n'
-          : '\nPress Enter once the Stream meeting page is open and ready...\n',
-      );
-  
-      targetPage = await selectTranscriptPage(prompt, debugPort);
-      console.log(`\nConnecting to: ${targetPage.title}`);
-  
-      cdp = await connectToPage(targetPage.webSocketDebuggerUrl);
-      await cdp.send('Runtime.enable');
-  
-      console.log(
-        captureControl === 'automatic'
-          ? 'Capturing transcript-related network responses in automatic mode...'
-          : 'Capturing transcript-related network responses...',
-      );
-      if (options.debug) {
+
+      while (shouldContinue) {
+        if (!hasCompletedExtraction) {
+          printInitialRunInstructions(captureControl);
+          await prompt.waitForEnter(
+            captureControl === 'automatic'
+              ? '\nPress Enter once the Stream meeting page is open and fully rendered...\n'
+              : '\nPress Enter once the Stream meeting page is open and ready...\n',
+          );
+        } else {
+          shouldContinue = await promptForNextExtraction(prompt, captureControl);
+          if (!shouldContinue) {
+            break;
+          }
+        }
+
+        targetPage = await selectTranscriptPage(prompt, debugPort);
+        console.log(`\nConnecting to: ${targetPage.title}`);
+
+        cdp = await connectToPage(targetPage.webSocketDebuggerUrl);
+        await cdp.send('Runtime.enable');
+
         console.log(
-          'Debug capture enabled: saving request/response lifecycle data, ' +
-            'candidate bodies, and WebSocket frames.',
+          captureControl === 'automatic'
+            ? 'Capturing transcript-related network responses in automatic mode...'
+            : 'Capturing transcript-related network responses...',
         );
-      }
-      const captureResult = await captureStreamNetwork(
-        cdp,
-        prompt,
-        options.debug,
-        captureControl,
-      );
-      const pageMetadata = await extractMeetingMetadata(cdp).catch(() => ({
-        title: targetPage?.title || '',
-        date: '',
-        recordedBy: '',
-        sourceUrl: targetPage?.url || '',
-        createdBy: '',
-        createdByEmail: '',
-        createdByTenantId: '',
-        sourceApplication: '',
-        recordingStartDateTime: '',
-        recordingEndDateTime: '',
-        sharePointFilePath: '',
-        sharePointItemUrl: '',
-      }));
-      const captureMetadata = extractMeetingMetadataFromCapture(captureResult);
-      const metadata = mergeMeetingMetadata(
-        pageMetadata,
-        captureMetadata,
-        targetPage,
-      );
-      const outputBasePath = buildOutputBasePath(
-        metadata.title || targetPage?.title || 'meeting',
-        options.outputName,
-        options.outputDir,
-      );
-      let networkOutputPath = '';
+        if (options.debug) {
+          console.log(
+            'Debug capture enabled: saving request/response lifecycle data, ' +
+              'candidate bodies, and WebSocket frames.',
+          );
+        }
+        const captureResult = await captureStreamNetwork(
+          cdp,
+          prompt,
+          options.debug,
+          captureControl,
+        );
+        const pageMetadata = await extractMeetingMetadata(cdp).catch(() => ({
+          title: targetPage?.title || '',
+          date: '',
+          recordedBy: '',
+          sourceUrl: targetPage?.url || '',
+          createdBy: '',
+          createdByEmail: '',
+          createdByTenantId: '',
+          sourceApplication: '',
+          recordingStartDateTime: '',
+          recordingEndDateTime: '',
+          sharePointFilePath: '',
+          sharePointItemUrl: '',
+        }));
+        const captureMetadata = extractMeetingMetadataFromCapture(captureResult);
+        const metadata = mergeMeetingMetadata(
+          pageMetadata,
+          captureMetadata,
+          targetPage,
+        );
+        const outputBasePath = buildOutputBasePath(
+          metadata.title || targetPage?.title || 'meeting',
+          options.outputName,
+          options.outputDir,
+        );
+        let networkOutputPath = '';
 
-      console.log(
-        `Observed ${captureResult.candidates.length} potentially relevant network response` +
-          `${captureResult.candidates.length === 1 ? '' : 's'}.`,
-      );
-      console.log(
-        `Parsed ${captureResult.transcriptMatchCount || 0} transcript payload match` +
-          `${captureResult.transcriptMatchCount === 1 ? '' : 'es'}.`,
-      );
+        console.log(
+          `Observed ${captureResult.candidates.length} potentially relevant network response` +
+            `${captureResult.candidates.length === 1 ? '' : 's'}.`,
+        );
+        console.log(
+          `Parsed ${captureResult.transcriptMatchCount || 0} transcript payload match` +
+            `${captureResult.transcriptMatchCount === 1 ? '' : 'es'}.`,
+        );
 
-      if (!captureResult.matchedCandidate) {
+        if (!captureResult.matchedCandidate) {
+          if (options.debug) {
+            const networkCapturePayload = buildNetworkCapturePayload({
+              options,
+              browser,
+              profile,
+              debugPort,
+              targetPage,
+              captureResult,
+            });
+            networkOutputPath = saveNetworkCaptureOutput(
+              networkCapturePayload,
+              outputBasePath,
+            );
+            console.log(`Saved network capture to: ${networkOutputPath}`);
+          }
+
+          throw new CliError(
+            buildMissingTranscriptCaptureMessage(
+              captureResult,
+              options.debug,
+              captureControl,
+            ),
+          );
+        }
+
         if (options.debug) {
           const networkCapturePayload = buildNetworkCapturePayload({
             options,
@@ -6962,52 +7083,33 @@ const runEmbeddedNetworkMode = (() => {
             networkCapturePayload,
             outputBasePath,
           );
+        }
+
+        const entries = captureResult.matchedCandidate.parsedEntries;
+        const outputPayload = buildOutputPayload(metadata, entries);
+        const outputPaths = saveOutputs(
+          outputPayload,
+          outputBasePath,
+          options.outputFormat,
+        );
+
+        console.log(
+          `Matched transcript payload: ${captureResult.matchedCandidate.url}`,
+        );
+        console.log(`Parsed ${entries.length} transcript entries.`);
+        for (const outputPath of outputPaths) {
+          console.log(`Saved transcript to: ${outputPath}`);
+        }
+        if (networkOutputPath) {
           console.log(`Saved network capture to: ${networkOutputPath}`);
         }
 
-        throw new CliError(
-          buildMissingTranscriptCaptureMessage(
-            captureResult,
-            options.debug,
-            captureControl,
-          ),
-        );
+        hasCompletedExtraction = true;
+        cdp.close();
+        cdp = null;
+        targetPage = null;
       }
 
-      if (options.debug) {
-        const networkCapturePayload = buildNetworkCapturePayload({
-          options,
-          browser,
-          profile,
-          debugPort,
-          targetPage,
-          captureResult,
-        });
-        networkOutputPath = saveNetworkCaptureOutput(
-          networkCapturePayload,
-          outputBasePath,
-        );
-      }
-
-      const entries = captureResult.matchedCandidate.parsedEntries;
-      const outputPayload = buildOutputPayload(metadata, entries);
-      const outputPaths = saveOutputs(
-        outputPayload,
-        outputBasePath,
-        options.outputFormat,
-      );
-  
-      console.log(
-        `Matched transcript payload: ${captureResult.matchedCandidate.url}`,
-      );
-      console.log(`Parsed ${entries.length} transcript entries.`);
-      for (const outputPath of outputPaths) {
-        console.log(`Saved transcript to: ${outputPath}`);
-      }
-      if (networkOutputPath) {
-        console.log(`Saved network capture to: ${networkOutputPath}`);
-      }
-  
       return 0;
     } catch (error) {
       return handleError(error);
