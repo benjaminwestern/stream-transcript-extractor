@@ -306,7 +306,7 @@ function printEntrypointHelp() {
     '  automatic Reload with capture armed, try to open the Transcript panel,',
   );
   console.log(
-    '             nudge/retry automatically, then explain the fallback if manual',
+    '             nudge/retry automatically, then keep capture armed if manual',
   );
   console.log(
     '             help is still needed.',
@@ -2257,6 +2257,7 @@ const runEmbeddedNetworkMode = (() => {
   const DEFAULT_CAPTURE_SETTLE_MS = 1_500;
   const DEFAULT_BROWSER_SHUTDOWN_TIMEOUT_MS = 8_000;
   const DEFAULT_AUTOMATIC_UI_POLL_MS = 250;
+  const DEFAULT_AUTOMATIC_CONTROL_DISCOVERY_TIMEOUT_MS = 5_000;
   const DEFAULT_AUTOMATIC_PANEL_OPEN_TIMEOUT_MS = 7_500;
   const DEFAULT_AUTOMATIC_SIGNAL_TIMEOUT_MS = 8_000;
   const DEFAULT_AUTOMATIC_SIGNAL_RETRY_TIMEOUT_MS = 6_000;
@@ -2483,10 +2484,10 @@ const runEmbeddedNetworkMode = (() => {
       '  automatic: let the extractor reload the page, try the Transcript panel',
     );
     console.log(
-      '             automatically, retry the panel actions, then explain any',
+      '             automatically, retry the panel actions, then keep capture',
     );
     console.log(
-      '             manual fallback before it asks for help.',
+      '             armed while it asks for any manual fallback.',
     );
   }
   
@@ -4817,7 +4818,10 @@ const runEmbeddedNetworkMode = (() => {
     console.log('1. Open the meeting in Microsoft Stream.');
     if (captureControl === 'automatic') {
       console.log(
-        '2. Return to this terminal and continue. The extractor will reload the page and manage the Transcript panel automatically.',
+        '2. Wait for the page to finish rendering, then return here and press Enter.',
+      );
+      console.log(
+        '3. The extractor will arm capture, reload once, and try the Transcript panel automatically.',
       );
       return;
     }
@@ -4849,14 +4853,16 @@ const runEmbeddedNetworkMode = (() => {
     console.log('5. Return to this terminal and press Enter.');
   }
 
-  function printAutomaticFallbackInstructions() {
-    console.log('\nAutomatic mode needs a manual assist.');
-    console.log('1. Open or reopen the Transcript panel in Microsoft Stream.');
-    console.log('2. Let the transcript load, and scroll once if the app lazily fetches chunks.');
+  function printAutomaticFallbackInstructions(reason = 'panel-open-failed') {
+    console.log('\nAutomatic mode needs a manual assist. Capture is still armed.');
     console.log(
-      '3. Watch this terminal for a transcript-traffic confirmation if one is seen.',
+      reason === 'panel-open-failed'
+        ? '1. In Stream, refresh the page if needed, then open or reopen the Transcript panel.'
+        : '1. In Stream, close and reopen the Transcript panel, then scroll once if the app lazily fetches chunks.',
     );
-    console.log('4. Return to this terminal and press Enter.');
+    console.log(
+      '2. Let the transcript finish loading. If this terminal reports transcript traffic first, you can press Enter as soon as the panel looks ready.',
+    );
   }
 
   function buildTranscriptPanelAutomationExpression(action = 'inspect') {
@@ -5380,6 +5386,19 @@ const runEmbeddedNetworkMode = (() => {
     );
   }
 
+  async function waitForTranscriptControl(
+    cdp,
+    timeoutMs = DEFAULT_AUTOMATIC_CONTROL_DISCOVERY_TIMEOUT_MS,
+  ) {
+    return waitForAsyncCondition(
+      async () => {
+        const state = await inspectTranscriptPanelUi(cdp);
+        return state.controlFound || state.panelLikelyOpen ? state : null;
+      },
+      timeoutMs,
+    );
+  }
+
   async function ensureTranscriptPanelOpenAutomatically(
     cdp,
     captureFeedback,
@@ -5419,7 +5438,7 @@ const runEmbeddedNetworkMode = (() => {
     }
 
     for (let attempt = 1; attempt <= 2; attempt += 1) {
-      const openResult = await performTranscriptPanelAction(cdp, 'open');
+      let openResult = await performTranscriptPanelAction(cdp, 'open');
       logAutomaticAction(
         captureFeedback,
         debugEnabled,
@@ -5427,12 +5446,35 @@ const runEmbeddedNetworkMode = (() => {
         summarizeTranscriptPanelUiState(openResult),
       );
       if (!openResult.controlFound && !openResult.panelLikelyOpen) {
-        return {
-          opened: false,
-          refreshed,
-          controlLabel: '',
-          state: openResult,
-        };
+        const controlState = await waitForTranscriptControl(cdp);
+        logAutomaticAction(
+          captureFeedback,
+          debugEnabled,
+          `wait for transcript control attempt ${attempt}`,
+          summarizeTranscriptPanelUiState(controlState),
+        );
+        if (controlState?.panelLikelyOpen) {
+          return {
+            opened: true,
+            refreshed,
+            controlLabel: controlState.controlLabel || '',
+            state: controlState,
+          };
+        }
+        if (!controlState?.controlFound) {
+          continue;
+        }
+
+        openResult = await performTranscriptPanelAction(cdp, 'open');
+        logAutomaticAction(
+          captureFeedback,
+          debugEnabled,
+          `open transcript panel delayed attempt ${attempt}`,
+          summarizeTranscriptPanelUiState(openResult),
+        );
+        if (!openResult.controlFound && !openResult.panelLikelyOpen) {
+          continue;
+        }
       }
 
       await sleep(DEFAULT_AUTOMATIC_CLICK_SETTLE_MS);
@@ -5554,9 +5596,9 @@ const runEmbeddedNetworkMode = (() => {
         debugEnabled,
         'automatic open failed, falling back to manual assist',
       );
-      printAutomaticFallbackInstructions();
+      printAutomaticFallbackInstructions('panel-open-failed');
       await prompt.waitForEnter(
-        '\nPress Enter after the transcript panel has loaded...\n',
+        '\nPress Enter after the transcript panel looks loaded or transcript traffic is detected...\n',
       );
       await sleep(DEFAULT_CAPTURE_SETTLE_MS);
       return;
@@ -5649,9 +5691,9 @@ const runEmbeddedNetworkMode = (() => {
         debugEnabled,
         'automatic signal wait failed, falling back to manual assist',
       );
-      printAutomaticFallbackInstructions();
+      printAutomaticFallbackInstructions('traffic-not-detected');
       await prompt.waitForEnter(
-        '\nPress Enter after the transcript panel has loaded...\n',
+        '\nPress Enter after the transcript panel looks loaded or transcript traffic is detected...\n',
       );
       await sleep(DEFAULT_CAPTURE_SETTLE_MS);
       return;
@@ -6842,7 +6884,9 @@ const runEmbeddedNetworkMode = (() => {
   
       printInitialRunInstructions(captureControl);
       await prompt.waitForEnter(
-        '\nPress Enter once the Stream meeting page is open and ready...\n',
+        captureControl === 'automatic'
+          ? '\nPress Enter once the Stream meeting page is open and fully rendered...\n'
+          : '\nPress Enter once the Stream meeting page is open and ready...\n',
       );
   
       targetPage = await selectTranscriptPage(prompt, debugPort);
@@ -6930,18 +6974,20 @@ const runEmbeddedNetworkMode = (() => {
         );
       }
 
-      const networkCapturePayload = buildNetworkCapturePayload({
-        options,
-        browser,
-        profile,
-        debugPort,
-        targetPage,
-        captureResult,
-      });
-      networkOutputPath = saveNetworkCaptureOutput(
-        networkCapturePayload,
-        outputBasePath,
-      );
+      if (options.debug) {
+        const networkCapturePayload = buildNetworkCapturePayload({
+          options,
+          browser,
+          profile,
+          debugPort,
+          targetPage,
+          captureResult,
+        });
+        networkOutputPath = saveNetworkCaptureOutput(
+          networkCapturePayload,
+          outputBasePath,
+        );
+      }
 
       const entries = captureResult.matchedCandidate.parsedEntries;
       const outputPayload = buildOutputPayload(metadata, entries);
@@ -6958,7 +7004,9 @@ const runEmbeddedNetworkMode = (() => {
       for (const outputPath of outputPaths) {
         console.log(`Saved transcript to: ${outputPath}`);
       }
-      console.log(`Saved network capture to: ${networkOutputPath}`);
+      if (networkOutputPath) {
+        console.log(`Saved network capture to: ${networkOutputPath}`);
+      }
   
       return 0;
     } catch (error) {

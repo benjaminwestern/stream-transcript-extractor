@@ -133,7 +133,7 @@ after you choose the mode.
 
 | Mode | What it does | Use it when |
 | --- | --- | --- |
-| `network` | Captures transcript-related network responses, loads response bodies, decrypts payloads when needed, and parses transcript entries from the transport layer. | You want the most reliable path, richer metadata, and a saved network capture on successful runs. |
+| `network` | Captures transcript-related network responses, loads response bodies, decrypts payloads when needed, and parses transcript entries from the transport layer. | You want the most reliable path, richer metadata, and an optional debug capture when needed. |
 | `automatic` | Uses the same network path, but reloads with capture armed, tries to open the **Transcript** panel, nudges the UI, retries once, and only then falls back to manual help. | You want the network extractor without the timing-sensitive panel-open step. |
 | `dom` | Scrolls the rendered transcript UI and extracts entries from the visible DOM. | You need a fallback when the transport changes, or you want to inspect the rendered transcript itself. |
 
@@ -166,7 +166,7 @@ Mode-specific output behavior:
 
 | Mode | Transcript files | Diagnostic behavior |
 | --- | --- | --- |
-| `network` | Writes `.json`, `.md`, or both based on `--format`. | Successful runs write `*.network.json`. Failed runs write `*.network.json` only when you use `--debug`. The terminal prints a live confirmation when likely transcript traffic is seen. |
+| `network` | Writes `.json`, `.md`, or both based on `--format`. | `*.network.json` is written only when you use `--debug`, whether the run succeeds or fails. The terminal prints a live confirmation when likely transcript traffic is seen. |
 | `automatic` | Writes the same transcript files as `network`. | Uses the same `*.network.json` behavior as `network`. `--debug` also prints the UI action trace, retry attempts, and fallback diagnosis. |
 | `dom` | Writes the same transcript files as the other modes. | `--debug` writes `*.debug.json` with DOM-level diagnostics. |
 
