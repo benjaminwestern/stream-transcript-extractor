@@ -83,11 +83,21 @@ Run from a release binary:
 The latest binaries are published on the
 [latest release page](https://github.com/benjaminwestern/stream-transcript-extractor/releases/latest).
 
+Run the extractor with no flags to open guided setup. This is the primary
+startup flow for the raw CLI and packaged EXE or DMG builds. Guided setup lets
+you choose the same runtime settings that the CLI flags expose. Press Enter in
+the guided menus to accept the recommended choice. The recommended path starts
+in `network` mode, writes Markdown output, uses an automatic browser control
+port, keeps diagnostics off, and closes the temporary browser window when the
+run finishes.
+
 These commands cover the common operator paths:
 
 ```bash
-# Default path
+# Guided startup with recommended choices preselected
 bun ./extract.js
+./stream-transcript-extractor-macos-arm64
+.\stream-transcript-extractor-windows-x64.exe
 
 # Force a mode
 bun ./extract.js --mode network
@@ -107,17 +117,21 @@ bun ./extract.js --help
 bun ./extract.js --version
 ```
 
+The guided no-flag flow exposes the same runtime settings as the CLI flags
+below. Use flags when you want to skip the menus, script a run, or pin a
+specific setting ahead of time.
+
 The supported CLI options are:
 
 | Option | Purpose |
 | --- | --- |
-| `--mode <network\|automatic\|dom>` | Choose the extractor mode. `network` is the default. |
-| `--browser <chrome\|edge>` | Use a specific browser instead of choosing interactively. |
+| `--mode <network\|automatic\|dom>` | Choose the extractor mode. `network` is the default for flag-driven runs and the recommended guided option. |
+| `--browser <chrome\|edge>` | Use a specific browser instead of choosing it in guided setup. |
 | `--profile <query>` | Match a profile by name, email, or directory name. |
 | `--output <name>` | Override the output filename prefix. |
 | `--output-dir <path>` | Write output files to a custom directory. |
-| `--format <json\|md\|both>` | Write JSON, Markdown, or both. |
-| `--debug-port <port>` | Force a specific remote debugging port. |
+| `--format <json\|md\|both>` | Write JSON, Markdown, or both. `md` is the default for flag-driven runs and the recommended guided option. |
+| `--debug-port <port>` | Force a specific browser control port. |
 | `--debug` | Write extra diagnostics for the selected mode. |
 | `--keep-browser-open` | Leave the launched browser open after extraction. |
 | `--help` | Print the CLI help text. |
@@ -128,8 +142,8 @@ The supported CLI options are:
 ![Modes](assets/header-modes.svg)
 
 All three modes solve the same user problem, but they optimize for different
-failure patterns. The entrypoint stays stable. The operator flow changes only
-after you choose the mode.
+failure patterns. The entrypoint stays stable. In guided setup, you choose the
+mode first. In flag-driven runs, you can pass `--mode` directly.
 
 | Mode | What it does | Use it when |
 | --- | --- | --- |
@@ -158,21 +172,22 @@ and fallback reason.
 
 ![Outputs and diagnostics](assets/header-outputs.svg)
 
-Each run can write JSON, Markdown, or both. The transcript outputs stay
-intentionally simple so they work for review, archive, LLM input, or diffing
-across browsers and operating systems.
+Each run can write Markdown, JSON, or both. Markdown is the default output for
+the no-flag CLI path and for flag-driven runs that omit `--format`. The
+transcript outputs stay intentionally simple so they work for review, archive,
+LLM input, or diffing across browsers and operating systems.
 
 Mode-specific output behavior:
 
 | Mode | Transcript files | Diagnostic behavior |
 | --- | --- | --- |
-| `network` | Writes `.json`, `.md`, or both based on `--format`. | `*.network.json` is written only when you use `--debug`, whether the run succeeds or fails. The terminal prints a live confirmation when likely transcript traffic is seen. |
-| `automatic` | Writes the same transcript files as `network`. | Uses the same `*.network.json` behavior as `network`. `--debug` also prints the UI action trace, retry attempts, and fallback diagnosis. |
+| `network` | Writes `.json`, `.md`, or both based on `--format`. | `*.network.json` is written only when you use `--debug`, whether the run succeeds or fails. The terminal prints a live confirmation when transcript data is detected. |
+| `automatic` | Writes the same transcript files as `network`. | Uses the same `*.network.json` behavior as `network`. `--debug` also prints the UI action trace, retry attempts, and fallback explanation. |
 | `dom` | Writes the same transcript files as the other modes. | `--debug` writes `*.debug.json` with DOM-level diagnostics. |
 
-Run summaries also distinguish between potentially relevant network responses
-and actual parsed transcript payload matches, which makes failed captures less
-misleading during triage.
+Run summaries also distinguish between possible transcript responses and actual
+parsed transcript matches, which makes failed captures less misleading during
+triage.
 
 <details>
 <summary>Sample JSON transcript output</summary>

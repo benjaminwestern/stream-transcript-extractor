@@ -70,13 +70,13 @@ def create_banner() -> str:
             <style><![CDATA[
               .badge {{ font-family: {FONT_MONO}; font-size: 13px; font-weight: 700; fill: {PALETTE["dark_text"]}; }}
               .eyebrow {{ font-family: {FONT_MONO}; font-size: 15px; font-weight: 700; letter-spacing: 0.14em; fill: {PALETTE["accent"]}; }}
-              .title {{ font-family: {FONT_MONO}; font-size: 40px; font-weight: 700; fill: {PALETTE["text"]}; }}
-              .subtitle {{ font-family: {FONT_MONO}; font-size: 18px; font-weight: 700; fill: {PALETTE["muted"]}; }}
-              .footer {{ font-family: {FONT_MONO}; font-size: 14px; font-weight: 700; fill: {PALETTE["dark_text"]}; }}
+              .title {{ font-family: {FONT_MONO}; font-size: 38px; font-weight: 700; fill: {PALETTE["text"]}; }}
+              .subtitle {{ font-family: {FONT_MONO}; font-size: 17px; font-weight: 700; fill: {PALETTE["muted"]}; }}
+              .footer {{ font-family: {FONT_MONO}; font-size: 13px; font-weight: 700; fill: {PALETTE["dark_text"]}; }}
               .panel-label {{ font-family: {FONT_MONO}; font-size: 12px; font-weight: 700; letter-spacing: 0.1em; fill: {PALETTE["accent"]}; }}
               .panel-title {{ font-family: {FONT_MONO}; font-size: 16px; font-weight: 700; fill: {PALETTE["dark_text"]}; }}
-              .panel-copy {{ font-family: {FONT_MONO}; font-size: 15px; fill: {PALETTE["dark_text"]}; }}
-              .panel-copy-muted {{ font-family: {FONT_MONO}; font-size: 14px; fill: {PALETTE["ink_alt"]}; }}
+              .panel-copy {{ font-family: {FONT_MONO}; font-size: 14px; fill: {PALETTE["dark_text"]}; }}
+              .panel-copy-muted {{ font-family: {FONT_MONO}; font-size: 13px; fill: {PALETTE["ink_alt"]}; }}
             ]]></style>
           </defs>
 
@@ -85,35 +85,35 @@ def create_banner() -> str:
             <rect width="1200" height="360" rx="28" fill="url(#ledger)" opacity="0.72" />
             <rect x="0" y="298" width="1200" height="62" fill="{PALETTE["paper_alt"]}" />
 
-            {layered_card(42, 34, 724, 250, 22, PALETTE["ink"], stroke="#2F404A").strip()}
+            {layered_card(42, 30, 724, 258, 22, PALETTE["ink"], stroke="#2F404A").strip()}
             <rect x="70" y="58" width="286" height="32" rx="9" fill="{PALETTE["paper"]}" />
             <text x="90" y="79" class="badge">&gt; stream-transcript-extractor</text>
             <rect x="70" y="112" width="28" height="3" rx="1.5" fill="{PALETTE["accent"]}" />
-            <text x="114" y="118" class="eyebrow">BROWSER-DRIVEN STREAM EXTRACTION</text>
-            <text x="70" y="168" class="title">Stream Transcript Extractor</text>
-            <text x="70" y="212" class="subtitle">browser-profile attach</text>
-            <text x="70" y="240" class="subtitle">network-first transcript capture</text>
-            <text x="70" y="268" class="subtitle">automatic panel recovery and DOM fallback</text>
+            <text x="114" y="120" class="eyebrow">BROWSER-DRIVEN STREAM EXTRACTION</text>
+            <text x="70" y="164" class="title">Stream Transcript Extractor</text>
+            <text x="70" y="208" class="subtitle">guided startup and CLI flags</text>
+            <text x="70" y="236" class="subtitle">network-first transcript capture</text>
+            <text x="70" y="264" class="subtitle">automatic panel recovery and Markdown-first output</text>
 
-            {layered_card(806, 48, 314, 132, 18, PALETTE["paper_alt"], stroke=PALETTE["line"], shadow_dx=6, shadow_dy=6).strip()}
-            <text x="834" y="80" class="panel-label">[ modes ]</text>
-            <text x="834" y="106" class="panel-title">capture paths</text>
-            <text x="834" y="136" class="panel-copy">network  automatic  dom</text>
-            <text x="834" y="160" class="panel-copy-muted">payload first, UI fallback</text>
+            {layered_card(796, 44, 330, 140, 18, PALETTE["paper_alt"], stroke=PALETTE["line"], shadow_dx=6, shadow_dy=6).strip()}
+            <text x="824" y="78" class="panel-label">[ modes ]</text>
+            <text x="824" y="104" class="panel-title">capture paths</text>
+            <text x="824" y="136" class="panel-copy">network  automatic  dom</text>
+            <text x="824" y="160" class="panel-copy-muted">payload first, UI fallback</text>
 
-            {layered_card(806, 188, 314, 136, 18, PALETTE["paper_alt"], stroke=PALETTE["line"], shadow_dx=6, shadow_dy=6).strip()}
-            <text x="834" y="220" class="panel-label">[ outputs ]</text>
-            <text x="834" y="246" class="panel-title">artifacts</text>
-            <text x="834" y="274" class="panel-copy">json  markdown</text>
-            <text x="834" y="296" class="panel-copy">.network.json</text>
-            <text x="834" y="318" class="panel-copy-muted">debug traces and release builds</text>
+            {layered_card(796, 188, 330, 148, 18, PALETTE["paper_alt"], stroke=PALETTE["line"], shadow_dx=6, shadow_dy=6).strip()}
+            <text x="824" y="220" class="panel-label">[ outputs ]</text>
+            <text x="824" y="246" class="panel-title">artifacts</text>
+            <text x="824" y="276" class="panel-copy">markdown  json</text>
+            <text x="824" y="300" class="panel-copy">.network.json</text>
+            <text x="824" y="322" class="panel-copy-muted">guided setup and diagnostics</text>
 
             <rect x="786" y="60" width="10" height="216" rx="5" fill="{PALETTE["gold"]}" />
-            <rect x="1144" y="62" width="16" height="16" rx="3" fill="{PALETTE["teal"]}" />
-            <rect x="1144" y="88" width="16" height="16" rx="3" fill="{PALETTE["accent"]}" />
-            <rect x="1144" y="114" width="16" height="16" rx="3" fill="{PALETTE["blue"]}" />
+            <rect x="1156" y="62" width="16" height="16" rx="3" fill="{PALETTE["teal"]}" />
+            <rect x="1156" y="88" width="16" height="16" rx="3" fill="{PALETTE["accent"]}" />
+            <rect x="1156" y="114" width="16" height="16" rx="3" fill="{PALETTE["blue"]}" />
 
-            <text x="70" y="334" class="footer">Chrome  •  Edge  •  Bun  •  network capture  •  automatic fallback  •  standalone builds</text>
+            <text x="70" y="334" class="footer">Chrome  •  Edge  •  guided startup  •  Markdown default  •  auto fallback  •  builds</text>
           </g>
         </svg>
         """

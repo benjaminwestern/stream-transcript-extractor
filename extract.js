@@ -26,6 +26,7 @@ const DEFAULT_EXTRACTOR_MODE = 'network';
 const SUPPORTED_EXTRACTOR_MODES = ['network', 'automatic', 'dom'];
 const SUPPORTED_BROWSER_KEYS = ['chrome', 'edge'];
 const SUPPORTED_OUTPUT_FORMATS = ['json', 'md', 'both'];
+const DEFAULT_OUTPUT_FORMAT = 'md';
 const DEFAULT_OUTPUT_DIR = 'output';
 const DEFAULT_CDP_HOST = '127.0.0.1';
 const DEFAULT_BROWSER_READY_TIMEOUT_MS = 15_000;
@@ -187,7 +188,7 @@ function parseDomModeArgs(argv) {
     profile: '',
     outputName: '',
     outputDir: DEFAULT_OUTPUT_DIR,
-    outputFormat: 'json',
+    outputFormat: DEFAULT_OUTPUT_FORMAT,
     debugPort: null,
     debug: false,
     keepBrowserOpen: false,
@@ -276,16 +277,26 @@ function printEntrypointHelp() {
   console.log('Usage:');
   console.log('  bun extract.js [options]');
   console.log('  ./<compiled-binary> [options]\n');
+  console.log('Guided setup:');
+  console.log(
+    '  Run with no flags in an interactive terminal to choose mode, browser, profile,',
+  );
+  console.log(
+    '  output settings, diagnostics, and browser shutdown behavior through menus.\n',
+  );
+  console.log('  Press Enter in guided menus to accept the recommended choice.\n');
   console.log('Options:');
   console.log(
     `  --mode <network|automatic|dom>  Choose the extractor mode (default: ${DEFAULT_EXTRACTOR_MODE}).`,
   );
-  console.log('  --browser <chrome|edge>  Use a specific browser.');
+  console.log('  --browser <chrome|edge>  Use a specific browser instead of the menu.');
   console.log('  --profile <query>        Match a profile by name, email, or directory.');
   console.log('  --output <name>          Override the output filename prefix.');
   console.log('  --output-dir <path>      Write output files to a custom directory.');
-  console.log('  --format <json|md|both>  Choose JSON, Markdown, or both outputs.');
-  console.log('  --debug-port <port>      Force a specific remote-debugging port.');
+  console.log(
+    `  --format <json|md|both>  Choose JSON, Markdown, or both outputs (default: ${DEFAULT_OUTPUT_FORMAT}).`,
+  );
+  console.log('  --debug-port <port>      Force a specific browser control port.');
   console.log(
     '  --debug                  Write extra diagnostics. In automatic mode this also',
   );
@@ -315,7 +326,7 @@ function printEntrypointHelp() {
     '  dom        Open the Stream page and Transcript panel before extraction starts.\n',
   );
   console.log('Examples:');
-  console.log('  bun extract.js');
+  console.log('  bun extract.js                # opens guided setup');
   console.log('  bun extract.js --mode network --debug');
   console.log('  bun extract.js --mode automatic');
   console.log('  bun extract.js --mode automatic --debug');
@@ -380,13 +391,24 @@ function printMenu(title, items) {
  * @param {T[]} items
  * @param {(item: T) => string} renderItem
  * @param {string} question
+ * @param {number | null} [defaultIndex]
  * @returns {Promise<T>}
  */
-async function chooseFromList(prompt, title, items, renderItem, question) {
+async function chooseFromList(
+  prompt,
+  title,
+  items,
+  renderItem,
+  question,
+  defaultIndex = null,
+) {
   printMenu(title, items.map(renderItem));
 
   while (true) {
     const answer = (await prompt.ask(question)).trim();
+    if (answer === '' && defaultIndex != null && items[defaultIndex]) {
+      return items[defaultIndex];
+    }
     const selectedIndex = Number.parseInt(answer, 10) - 1;
     const selectedItem = items[selectedIndex];
 
@@ -395,6 +417,368 @@ async function chooseFromList(prompt, title, items, renderItem, question) {
     }
 
     console.log('Enter one of the listed numbers.');
+  }
+}
+
+function shouldUseGuidedSetup(argv) {
+  return (
+    argv.length === 0 &&
+    Boolean(process.stdin.isTTY) &&
+    Boolean(process.stdout.isTTY)
+  );
+}
+
+function buildForwardedArgsFromOptions(options) {
+  const forwardedArgs = [];
+
+  if (options.browser) {
+    forwardedArgs.push('--browser', options.browser);
+  }
+
+  if (options.profile) {
+    forwardedArgs.push('--profile', options.profile);
+  }
+
+  if (options.outputName) {
+    forwardedArgs.push('--output', options.outputName);
+  }
+
+  if (options.outputDir && options.outputDir !== DEFAULT_OUTPUT_DIR) {
+    forwardedArgs.push('--output-dir', options.outputDir);
+  }
+
+  if (options.outputFormat && options.outputFormat !== DEFAULT_OUTPUT_FORMAT) {
+    forwardedArgs.push('--format', options.outputFormat);
+  }
+
+  if (options.debugPort != null) {
+    forwardedArgs.push('--debug-port', String(options.debugPort));
+  }
+
+  if (options.debug) {
+    forwardedArgs.push('--debug');
+  }
+
+  if (options.keepBrowserOpen) {
+    forwardedArgs.push('--keep-browser-open');
+  }
+
+  return forwardedArgs;
+}
+
+function formatSettingValue(value, fallback) {
+  return value ? value : fallback;
+}
+
+async function chooseModeInteractively(prompt) {
+  const modes = [
+    {
+      value: 'network',
+      label: 'Network (recommended)',
+      description: 'Capture the transcript payload directly with the most reliable flow.',
+    },
+    {
+      value: 'automatic',
+      label: 'Automatic',
+      description: 'Use network capture, reload once, and try the Transcript panel for me.',
+    },
+    {
+      value: 'dom',
+      label: 'DOM',
+      description: 'Scroll the rendered transcript UI when transport capture is unsuitable.',
+    },
+  ];
+
+  const selectedMode = await chooseFromList(
+    prompt,
+    'Capture mode',
+    modes,
+    (mode) => `${mode.label} - ${mode.description}`,
+    '\nSelect mode (number, Enter for recommended): ',
+    0,
+  );
+
+  return selectedMode.value;
+}
+
+async function chooseGuidedSetupPath(prompt) {
+  const setupPaths = [
+    {
+      value: 'recommended',
+      label: 'Recommended settings',
+      description: 'Use the default output, automatic debug port, and no extra diagnostics.',
+    },
+    {
+      value: 'custom',
+      label: 'Review all settings',
+      description: 'Choose output, diagnostics, remote debug port, and browser shutdown behavior.',
+    },
+  ];
+
+  const selectedPath = await chooseFromList(
+    prompt,
+    'Run setup',
+    setupPaths,
+    (item) => `${item.label} - ${item.description}`,
+    '\nSelect setup path (number, Enter for recommended): ',
+    0,
+  );
+
+  return selectedPath.value;
+}
+
+async function chooseOutputFormatInteractively(prompt) {
+  const formats = [
+    {
+      value: 'md',
+      label: 'Markdown only (recommended)',
+      description: 'Write one review-friendly transcript file.',
+    },
+    {
+      value: 'json',
+      label: 'JSON only',
+      description: 'Write one machine-friendly transcript file.',
+    },
+    {
+      value: 'both',
+      label: 'JSON and Markdown',
+      description: 'Write both transcript formats for the same run.',
+    },
+  ];
+
+  const selectedFormat = await chooseFromList(
+    prompt,
+    'Output format',
+    formats,
+    (format) => `${format.label} - ${format.description}`,
+    '\nSelect output format (number, Enter for recommended): ',
+    0,
+  );
+
+  return selectedFormat.value;
+}
+
+async function chooseOutputNameInteractively(prompt) {
+  const namingOptions = [
+    {
+      value: 'automatic',
+      label: 'Automatic name (recommended)',
+      description: 'Build the filename prefix from the meeting metadata.',
+    },
+    {
+      value: 'custom',
+      label: 'Custom name',
+      description: 'Enter the filename prefix yourself.',
+    },
+  ];
+
+  const selectedNaming = await chooseFromList(
+    prompt,
+    'Output filename prefix',
+    namingOptions,
+    (option) => `${option.label} - ${option.description}`,
+    '\nSelect naming option (number, Enter for recommended): ',
+    0,
+  );
+
+  if (selectedNaming.value !== 'custom') {
+    return '';
+  }
+
+  return (await prompt.ask(
+    '\nEnter the output filename prefix, or press Enter to keep automatic naming: ',
+  )).trim();
+}
+
+async function chooseOutputDirectoryInteractively(prompt) {
+  const outputDirectories = [
+    {
+      value: 'default',
+      label: `Default directory (${DEFAULT_OUTPUT_DIR})`,
+      description: 'Write transcript files to the standard output folder.',
+    },
+    {
+      value: 'custom',
+      label: 'Custom directory',
+      description: 'Choose a different output folder for this run.',
+    },
+  ];
+
+  const selectedDirectory = await chooseFromList(
+    prompt,
+    'Output directory',
+    outputDirectories,
+    (option) => `${option.label} - ${option.description}`,
+    '\nSelect output directory option (number, Enter for recommended): ',
+    0,
+  );
+
+  if (selectedDirectory.value !== 'custom') {
+    return DEFAULT_OUTPUT_DIR;
+  }
+
+  const customOutputDir = (await prompt.ask(
+    `\nEnter the output directory, or press Enter to keep ${DEFAULT_OUTPUT_DIR}: `,
+  )).trim();
+
+  return customOutputDir || DEFAULT_OUTPUT_DIR;
+}
+
+async function chooseDebugSettingInteractively(prompt) {
+  const debugChoices = [
+    {
+      value: false,
+      label: 'Debug off (recommended)',
+      description: 'Skip extra diagnostics and keep the terminal output focused.',
+    },
+    {
+      value: true,
+      label: 'Debug on',
+      description: 'Save deeper diagnostics and print more mode-specific detail.',
+    },
+  ];
+
+  const selectedDebugChoice = await chooseFromList(
+    prompt,
+    'Diagnostics',
+    debugChoices,
+    (choice) => `${choice.label} - ${choice.description}`,
+    '\nSelect diagnostics setting (number, Enter for recommended): ',
+    0,
+  );
+
+  return selectedDebugChoice.value;
+}
+
+async function chooseDebugPortInteractively(prompt) {
+  const portChoices = [
+    {
+      value: 'automatic',
+      label: 'Automatic port (recommended)',
+      description: 'Let the extractor choose an open browser control port.',
+    },
+    {
+      value: 'custom',
+      label: 'Custom port',
+      description: 'Choose the exact browser control port yourself.',
+    },
+  ];
+
+  const selectedPortChoice = await chooseFromList(
+    prompt,
+    'Browser control port',
+    portChoices,
+    (choice) => `${choice.label} - ${choice.description}`,
+    '\nSelect port setting (number, Enter for recommended): ',
+    0,
+  );
+
+  if (selectedPortChoice.value !== 'custom') {
+    return null;
+  }
+
+  while (true) {
+    const answer = (await prompt.ask(
+      '\nEnter the browser control port, or press Enter to keep automatic port selection: ',
+    )).trim();
+
+    if (!answer) {
+      return null;
+    }
+
+    const parsedPort = Number.parseInt(answer, 10);
+    if (Number.isInteger(parsedPort) && parsedPort >= 1 && parsedPort <= 65_535) {
+      return parsedPort;
+    }
+
+    console.log('Enter a valid port between 1 and 65535.');
+  }
+}
+
+async function chooseKeepBrowserOpenInteractively(prompt) {
+  const keepBrowserOpenChoices = [
+    {
+      value: false,
+      label: 'Close the browser when finished (recommended)',
+      description: 'Shut down the temporary browser window after extraction.',
+    },
+    {
+      value: true,
+      label: 'Keep the browser open',
+      description: 'Leave the launched browser window open after extraction.',
+    },
+  ];
+
+  const selectedChoice = await chooseFromList(
+    prompt,
+    'Browser shutdown behavior',
+    keepBrowserOpenChoices,
+    (choice) => `${choice.label} - ${choice.description}`,
+    '\nSelect browser shutdown behavior (number, Enter for recommended): ',
+    0,
+  );
+
+  return selectedChoice.value;
+}
+
+function printGuidedSetupSummary({ mode, browser, profile, options }) {
+  console.log('\nRun summary');
+  console.log(`  Mode: ${mode}`);
+  console.log(`  Browser: ${browser.name}`);
+  console.log(`  Profile: ${profile.displayName}`);
+  console.log(`  Output format: ${options.outputFormat}`);
+  console.log(
+    `  Output name: ${formatSettingValue(options.outputName, 'Automatic from meeting metadata')}`,
+  );
+  console.log(`  Output directory: ${options.outputDir}`);
+  console.log(`  Debug diagnostics: ${options.debug ? 'On' : 'Off'}`);
+  console.log(
+    `  Browser control port: ${options.debugPort == null ? 'Automatic' : options.debugPort}`,
+  );
+  console.log(
+    `  Keep browser open: ${options.keepBrowserOpen ? 'Yes' : 'No'}`,
+  );
+}
+
+async function runGuidedSetup() {
+  ensureSupportedPlatform();
+
+  const prompt = createPrompt();
+  const options = parseDomModeArgs([]);
+
+  try {
+    console.log('\nGuided setup');
+    console.log(
+      'Choose a mode first, then keep the recommended defaults or review the full run settings.',
+    );
+    console.log('Press Enter in the guided menus to accept the recommended choice.');
+
+    const mode = await chooseModeInteractively(prompt);
+    const { browser, profile } = await selectBrowserAndProfile(options, prompt);
+    options.browser = browser.key;
+    options.profile = profile.dirName;
+
+    const setupPath = await chooseGuidedSetupPath(prompt);
+    if (setupPath === 'custom') {
+      options.outputFormat = await chooseOutputFormatInteractively(prompt);
+      options.outputName = await chooseOutputNameInteractively(prompt);
+      options.outputDir = await chooseOutputDirectoryInteractively(prompt);
+      options.debug = await chooseDebugSettingInteractively(prompt);
+      options.debugPort = await chooseDebugPortInteractively(prompt);
+      options.keepBrowserOpen = await chooseKeepBrowserOpenInteractively(prompt);
+    }
+
+    printGuidedSetupSummary({ mode, browser, profile, options });
+    await prompt.waitForEnter(
+      '\nPress Enter to launch the extractor with these settings...\n',
+    );
+
+    return {
+      mode,
+      forwardedArgs: buildForwardedArgsFromOptions(options),
+    };
+  } finally {
+    prompt.close();
   }
 }
 
@@ -587,7 +971,9 @@ async function waitForBrowserDebugEndpoint(port) {
     await sleep(500);
   }
 
-  throw new CliError('Browser failed to start in debug mode.');
+  throw new CliError(
+    'The browser did not finish opening the temporary controlled window.',
+  );
 }
 
 async function waitForBrowserPageTarget(
@@ -610,7 +996,7 @@ async function waitForBrowserPageTarget(
   }
 
   throw new CliError(
-    'Browser launched in debug mode but no page window became available.',
+    'The browser opened, but no tab window became available.',
   );
 }
 
@@ -872,7 +1258,7 @@ async function ensureBrowserIsClosed(prompt, browser) {
   while (isBrowserRunning(browser.processName)) {
     console.log(`\n${browser.name} is still running.`);
     console.log(
-      'Close it so the extractor can relaunch the selected profile in debug mode.',
+      'Close it so the extractor can reopen that profile in a temporary controlled window.',
     );
     await prompt.waitForEnter('\nPress Enter after the browser is closed...\n');
   }
@@ -2011,7 +2397,7 @@ async function selectTranscriptPage(prompt, debugPort) {
 
   if (pages.length === 0) {
     throw new CliError(
-      'No browser pages were found. Open Microsoft Stream before continuing.',
+      'No browser tabs were found. Open the Stream meeting, then try again.',
     );
   }
 
@@ -2029,14 +2415,14 @@ async function selectTranscriptPage(prompt, debugPort) {
     'Open pages',
     pages,
     (page) => `${page.title} (${page.url.slice(0, 80)})`,
-    '\nWhich page contains the transcript? (number): ',
+    '\nWhich tab has the Stream meeting? (number): ',
   );
 }
 
 function printRunInstructions() {
-  console.log('\nBrowser is ready.');
+  console.log('\nBrowser window is ready.');
   console.log('1. Open the meeting in Microsoft Stream.');
-  console.log('2. Open the Transcript panel.');
+  console.log('2. Open the Transcript panel and let it finish loading.');
   console.log('3. Return to this terminal and continue.');
 }
 
@@ -2086,21 +2472,23 @@ async function runDomMode() {
     tempDataDir = join(tmpdir(), `stream-transcript-extractor-${Date.now()}`);
     mkdirSync(tempDataDir, { recursive: true });
 
-    console.log('Preparing temporary browser profile...');
+    console.log('Setting up a temporary browser session...');
     prepareTempProfile(browser.basePath, profile, tempDataDir);
 
-    console.log(`Launching ${browser.name} on debug port ${debugPort}...`);
+    console.log(`Starting ${browser.name}...`);
     browserProcess = launchBrowser(browser, profile, tempDataDir, debugPort);
 
-    console.log('Waiting for the browser debug endpoint...');
+    console.log('Waiting for the browser window to finish opening...');
     await waitForBrowserDebugEndpoint(debugPort);
     await waitForBrowserPageTarget(debugPort);
 
     printRunInstructions();
-    await prompt.waitForEnter('\nPress Enter to start extracting...\n');
+    await prompt.waitForEnter(
+      '\nPress Enter when the Stream tab and Transcript panel are ready...\n',
+    );
 
     targetPage = await selectTranscriptPage(prompt, debugPort);
-    console.log(`\nConnecting to: ${targetPage.title}`);
+    console.log(`\nUsing tab: ${targetPage.title}`);
 
     cdp = await connectToPage(targetPage.webSocketDebuggerUrl);
 
@@ -2130,7 +2518,7 @@ async function runDomMode() {
           error: extractionResult.error,
         });
         const debugPath = saveDebugOutput(debugPayload, failureOutputBasePath);
-        console.log(`Saved debug output to: ${debugPath}`);
+        console.log(`Saved diagnostic file: ${debugPath}`);
       }
 
       throw new CliError(extractionResult.error);
@@ -2138,8 +2526,8 @@ async function runDomMode() {
 
     const entries = extractionResult.entries;
     console.log(
-      `Scroll passes: ${extractionResult.scrollCount}, ` +
-        `last timestamp: ${extractionResult.lastTimestamp || 'n/a'}.`,
+      `Scrolled ${extractionResult.scrollCount} times. ` +
+        `Last timestamp seen: ${extractionResult.lastTimestamp || 'n/a'}.`,
     );
     if (options.debug && extractionResult.debug) {
       console.log(
@@ -2168,7 +2556,7 @@ async function runDomMode() {
             'No transcript entries were found. Confirm the transcript panel is open and visible.',
         });
         const debugPath = saveDebugOutput(debugPayload, failureOutputBasePath);
-        console.log(`Saved debug output to: ${debugPath}`);
+        console.log(`Saved diagnostic file: ${debugPath}`);
       }
 
       throw new CliError(
@@ -2201,13 +2589,13 @@ async function runDomMode() {
       debugPath = saveDebugOutput(debugPayload, outputBasePath);
     }
 
-    console.log(`Extracted ${entries.length} entries.`);
+    console.log(`Extracted ${entries.length} transcript entries.`);
     console.log(`Speakers: ${outputPayload.speakers.join(', ')}`);
     for (const outputPath of outputPaths) {
-      console.log(`Saved transcript to: ${outputPath}`);
+      console.log(`Saved transcript file: ${outputPath}`);
     }
     if (debugPath) {
-      console.log(`Saved debug output to: ${debugPath}`);
+      console.log(`Saved diagnostic file: ${debugPath}`);
     }
 
     return 0;
@@ -2368,7 +2756,7 @@ const runEmbeddedNetworkMode = (() => {
       profile: '',
       outputName: '',
       outputDir: DEFAULT_OUTPUT_DIR,
-      outputFormat: 'json',
+      outputFormat: DEFAULT_OUTPUT_FORMAT,
       debugPort: null,
       debug: false,
       keepBrowserOpen: false,
@@ -2457,13 +2845,23 @@ const runEmbeddedNetworkMode = (() => {
     console.log('Usage:');
     console.log('  bun extract.js --mode <network|automatic> [options]');
     console.log('  ./<compiled-binary> [options]\n');
+    console.log('Guided setup:');
+    console.log(
+      '  Run with no flags in an interactive terminal to choose mode, browser, profile,',
+    );
+    console.log(
+      '  output settings, diagnostics, and browser shutdown behavior through menus.\n',
+    );
+    console.log('  Press Enter in guided menus to accept the recommended choice.\n');
     console.log('Options:');
-    console.log('  --browser <chrome|edge>  Use a specific browser.');
+    console.log('  --browser <chrome|edge>  Use a specific browser instead of the menu.');
     console.log('  --profile <query>        Match a profile by name, email, or directory.');
     console.log('  --output <name>          Override the output filename prefix.');
     console.log('  --output-dir <path>      Write files to a custom directory.');
-    console.log('  --format <json|md|both>  Choose JSON, Markdown, or both outputs.');
-    console.log('  --debug-port <port>      Force a specific remote-debugging port.');
+    console.log(
+      `  --format <json|md|both>  Choose JSON, Markdown, or both outputs (default: ${DEFAULT_OUTPUT_FORMAT}).`,
+    );
+    console.log('  --debug-port <port>      Force a specific browser control port.');
     console.log(
       '  --debug                  Save extended network diagnostics, including ' +
         'request/response lifecycle data, candidate bodies, and WebSocket frames.',
@@ -2787,7 +3185,9 @@ const runEmbeddedNetworkMode = (() => {
       await sleep(500);
     }
   
-    throw new CliError('Browser failed to start in debug mode.');
+    throw new CliError(
+      'The browser did not finish opening the temporary controlled window.',
+    );
   }
   
   async function waitForBrowserPageTarget(
@@ -2810,7 +3210,7 @@ const runEmbeddedNetworkMode = (() => {
     }
   
     throw new CliError(
-      'Browser launched in debug mode but no page window became available.',
+      'The browser opened, but no tab window became available.',
     );
   }
   
@@ -3072,9 +3472,11 @@ const runEmbeddedNetworkMode = (() => {
     while (isBrowserRunning(browser.processName)) {
       console.log(`\n${browser.name} is still running.`);
       console.log(
-        'Close it so the extractor can relaunch the selected profile in debug mode.',
+        'Close it so the extractor can reopen that profile in a temporary controlled window.',
       );
-      await prompt.waitForEnter('\nPress Enter after the browser is closed...\n');
+      await prompt.waitForEnter(
+        '\nPress Enter after the browser is closed...\n',
+      );
     }
   }
   
@@ -4792,7 +5194,7 @@ const runEmbeddedNetworkMode = (() => {
   
     if (pages.length === 0) {
       throw new CliError(
-        'No browser pages were found. Open Microsoft Stream before continuing.',
+        'No browser tabs were found. Open the Stream meeting, then try again.',
       );
     }
   
@@ -4810,59 +5212,59 @@ const runEmbeddedNetworkMode = (() => {
       'Open pages',
       pages,
       (page) => `${page.title} (${page.url.slice(0, 80)})`,
-      '\nWhich page contains the Microsoft Stream meeting? (number): ',
+      '\nWhich tab has the Stream meeting? (number): ',
     );
   }
   
   function printInitialRunInstructions(captureControl = 'manual') {
-    console.log('\nBrowser is ready.');
+    console.log('\nBrowser window is ready.');
     console.log('1. Open the meeting in Microsoft Stream.');
     if (captureControl === 'automatic') {
       console.log(
-        '2. Wait for the page to finish rendering, then return here and press Enter.',
+        '2. Wait for the page to finish loading, then return here and press Enter.',
       );
       console.log(
-        '3. The extractor will arm capture, reload once, and try the Transcript panel automatically.',
+        '3. The extractor will start capture, reload once, and try the Transcript panel for you.',
       );
       return;
     }
 
     console.log('2. Leave the Transcript panel closed for now.');
-    console.log('3. Return to this terminal and continue so capture can be armed.');
+    console.log('3. Return to this terminal so transcript capture can begin.');
   }
   
   function printCaptureInstructions(debugEnabled = false) {
-    console.log('\nNetwork capture is armed.');
+    console.log('\nTranscript capture is ready.');
     if (debugEnabled) {
       console.log('1. Wait for the automatic page reload to finish.');
       console.log('2. Open the Transcript panel in Microsoft Stream.');
-      console.log('3. If the panel is already open, close and reopen it if possible.');
-      console.log('4. Let the transcript load, and scroll once if the app lazily fetches chunks.');
+      console.log('3. If the panel is already open, close and reopen it once.');
+      console.log('4. Let the transcript finish loading. Scroll once if more lines load as you move.');
       console.log(
-        '5. Watch this terminal for a transcript-traffic confirmation if one is seen.',
+        '5. Watch this terminal for a confirmation if transcript data is detected.',
       );
       console.log('6. Return to this terminal and press Enter.');
       return;
     }
   
     console.log('1. Open the Transcript panel in Microsoft Stream.');
-    console.log('2. If the panel is already open, close and reopen it if possible.');
-    console.log('3. Let the transcript load, and scroll once if the app lazily fetches chunks.');
+    console.log('2. If the panel is already open, close and reopen it once.');
+    console.log('3. Let the transcript finish loading. Scroll once if more lines load as you move.');
     console.log(
-      '4. Watch this terminal for a transcript-traffic confirmation if one is seen.',
+      '4. Watch this terminal for a confirmation if transcript data is detected.',
     );
     console.log('5. Return to this terminal and press Enter.');
   }
 
   function printAutomaticFallbackInstructions(reason = 'panel-open-failed') {
-    console.log('\nAutomatic mode needs a manual assist. Capture is still armed.');
+    console.log('\nAutomatic mode needs one manual step. Transcript capture is still running.');
     console.log(
       reason === 'panel-open-failed'
-        ? '1. In Stream, open or reopen the Transcript panel, then scroll once if the app lazily fetches chunks.'
-        : '1. In Stream, close and reopen the Transcript panel, then scroll once if the app lazily fetches chunks.',
+        ? '1. In Stream, open or reopen the Transcript panel, then scroll once if more lines load as you move.'
+        : '1. In Stream, close and reopen the Transcript panel, then scroll once if more lines load as you move.',
     );
     console.log(
-      '2. Let the transcript finish loading, watch this terminal for transcript traffic, then press Enter.',
+      '2. Let the transcript finish loading, watch this terminal for a confirmation, then press Enter.',
     );
   }
 
@@ -4872,7 +5274,7 @@ const runEmbeddedNetworkMode = (() => {
       '1. Open the next Microsoft Stream meeting in a new tab in the existing browser window.',
     );
     if (captureControl === 'automatic') {
-      console.log('2. Wait for the page to finish rendering.');
+      console.log('2. Wait for the page to finish loading.');
     } else {
       console.log('2. Leave the Transcript panel closed for now.');
     }
@@ -5292,7 +5694,7 @@ const runEmbeddedNetworkMode = (() => {
     }
 
     const detailSuffix = details ? ` ${JSON.stringify(details)}` : '';
-    console.log(`[automatic debug] ${step}${detailSuffix}`);
+    console.log(`[automatic trace] ${step}${detailSuffix}`);
   }
 
   function countAutomaticActions(captureFeedback, prefix) {
@@ -5349,17 +5751,17 @@ const runEmbeddedNetworkMode = (() => {
 
       if (captureFeedback.transcriptHintCount > 0) {
         lines.push(
-          `I saw ${captureFeedback.transcriptHintCount} transcript-like network response` +
-            `${captureFeedback.transcriptHintCount === 1 ? '' : 's'}, but none produced a usable transcript payload yet.`,
+          `Detected ${captureFeedback.transcriptHintCount} possible transcript response` +
+            `${captureFeedback.transcriptHintCount === 1 ? '' : 's'}, but none produced a usable transcript yet.`,
         );
       } else if (captureFeedback.candidateResponseCount > 0) {
         lines.push(
-          `I saw ${captureFeedback.candidateResponseCount} potentially relevant network response` +
+          `Detected ${captureFeedback.candidateResponseCount} related Stream response` +
             `${captureFeedback.candidateResponseCount === 1 ? '' : 's'}, but none looked transcript-specific.`,
         );
       } else {
         lines.push(
-          'I did not see any transcript-like network responses after the automatic panel actions.',
+          'No transcript data was detected after the automatic panel actions.',
         );
       }
     }
@@ -5604,11 +6006,11 @@ const runEmbeddedNetworkMode = (() => {
     captureFeedback,
     debugEnabled,
   ) {
-    console.log('\nAutomatic mode: reloading the page with capture armed...');
+    console.log('\nAutomatic mode: reloading the page and starting capture...');
     logAutomaticAction(captureFeedback, debugEnabled, 'reload page');
     await reloadPageAndWait(cdp);
 
-    console.log('Automatic mode: locating the Transcript control...');
+    console.log('Automatic mode: looking for the Transcript button...');
     let panelResult = await ensureTranscriptPanelOpenAutomatically(
       cdp,
       captureFeedback,
@@ -5626,7 +6028,7 @@ const runEmbeddedNetworkMode = (() => {
 
     if (!panelResult.opened) {
       console.log(
-        'Automatic mode: could not open the Transcript panel automatically.',
+        'Automatic mode: could not open the Transcript panel. Manual help is next.',
       );
       printAutomaticFallbackSummary(
         'panel-open-failed',
@@ -5640,7 +6042,7 @@ const runEmbeddedNetworkMode = (() => {
       );
       printAutomaticFallbackInstructions('panel-open-failed');
       await prompt.waitForEnter(
-        '\nPress Enter after the transcript panel looks loaded or transcript traffic is detected...\n',
+        '\nPress Enter after the Transcript panel looks loaded, or after this terminal says transcript data was detected...\n',
       );
       await sleep(DEFAULT_CAPTURE_SETTLE_MS);
       return;
@@ -5649,21 +6051,21 @@ const runEmbeddedNetworkMode = (() => {
     console.log(
       panelResult.refreshed
         ? 'Automatic mode: refreshed and reopened the Transcript panel.'
-        : 'Automatic mode: opened the Transcript panel automatically.',
+        : 'Automatic mode: opened the Transcript panel.',
     );
     if (panelResult.controlLabel) {
-      console.log(`Automatic mode: using control "${panelResult.controlLabel}".`);
+      console.log(`Automatic mode: used "${panelResult.controlLabel}".`);
     }
 
     if (
       await nudgeTranscriptPanelAutomatically(cdp, captureFeedback, debugEnabled)
     ) {
       console.log(
-        'Automatic mode: nudged the Transcript panel to trigger lazy loading.',
+        'Automatic mode: scrolled the Transcript panel to load more lines.',
       );
     }
 
-    console.log('Automatic mode: waiting for transcript network traffic...');
+    console.log('Automatic mode: waiting for transcript data to load...');
     logAutomaticAction(
       captureFeedback,
       debugEnabled,
@@ -5679,7 +6081,7 @@ const runEmbeddedNetworkMode = (() => {
 
     if (!transcriptSignal) {
       console.log(
-        'Automatic mode: no transcript traffic yet. Nudging the panel once more.',
+        'Automatic mode: transcript data has not loaded yet. Trying one more scroll.',
       );
       logAutomaticAction(
         captureFeedback,
@@ -5695,7 +6097,7 @@ const runEmbeddedNetworkMode = (() => {
 
     if (!transcriptSignal) {
       console.log(
-        'Automatic mode: no transcript traffic after opening the panel. Retrying one panel refresh.',
+        'Automatic mode: transcript data still has not loaded. Trying one panel refresh.',
       );
       logAutomaticAction(
         captureFeedback,
@@ -5721,7 +6123,7 @@ const runEmbeddedNetworkMode = (() => {
 
     if (!transcriptSignal) {
       console.log(
-        'Automatic mode: still no transcript traffic. Trying one final automatic reopen-and-scroll pass.',
+        'Automatic mode: transcript data still has not loaded. Trying one final reopen and scroll.',
       );
       logAutomaticAction(
         captureFeedback,
@@ -5765,7 +6167,7 @@ const runEmbeddedNetworkMode = (() => {
 
     if (!transcriptSignal) {
       console.log(
-        'Automatic mode: transcript traffic was not detected automatically.',
+        'Automatic mode: transcript data was not detected automatically.',
       );
       printAutomaticFallbackSummary(
         'traffic-not-detected',
@@ -5779,14 +6181,14 @@ const runEmbeddedNetworkMode = (() => {
       );
       printAutomaticFallbackInstructions('traffic-not-detected');
       await prompt.waitForEnter(
-        '\nPress Enter after the transcript panel looks loaded or transcript traffic is detected...\n',
+        '\nPress Enter after the Transcript panel looks loaded, or after this terminal says transcript data was detected...\n',
       );
       await sleep(DEFAULT_CAPTURE_SETTLE_MS);
       return;
     }
 
     console.log(
-      `Automatic mode: observed ${transcriptSignal.transcriptHintCount} transcript-like network response` +
+      `Automatic mode: detected ${transcriptSignal.transcriptHintCount} transcript data response` +
         `${transcriptSignal.transcriptHintCount === 1 ? '' : 's'}.`,
     );
     logAutomaticAction(
@@ -5802,7 +6204,7 @@ const runEmbeddedNetworkMode = (() => {
     );
     if (settledSignal) {
       console.log(
-        'Automatic mode: transcript response activity settled. Continuing extraction.',
+        'Automatic mode: transcript data finished loading. Starting extraction.',
       );
       logAutomaticAction(
         captureFeedback,
@@ -5812,7 +6214,7 @@ const runEmbeddedNetworkMode = (() => {
       );
     } else {
       console.log(
-        'Automatic mode: transcript traffic was seen, but the response did not fully settle before capture ended.',
+        'Automatic mode: transcript data was detected, but loading did not fully settle before the wait ended.',
       );
       logAutomaticAction(
         captureFeedback,
@@ -6882,34 +7284,33 @@ const runEmbeddedNetworkMode = (() => {
     const transcriptHintCount =
       captureResult.captureFeedback?.transcriptHintCount || 0;
 
-    let guidance =
-      'No transcript payload was observed after network capture started.';
+    let guidance = 'No transcript data was captured after listening started.';
 
     if (candidateResponseCount === 0) {
       guidance +=
-        ' No transcript-related network responses were captured while the terminal was armed.';
+        ' No transcript-related responses were captured while this terminal was listening.';
     } else if (transcriptHintCount === 0) {
       guidance +=
         ' Some Stream responses were captured, but none looked transcript-specific.';
     } else {
       guidance +=
-        ' Transcript-like traffic was detected, but none of the captured bodies parsed into transcript entries.';
+        ' Transcript data was detected, but none of the captured responses parsed into transcript entries.';
     }
 
     if (debugEnabled) {
-      return `${guidance} Review the saved .network.json capture.`;
+      return `${guidance} Review the saved diagnostic capture (.network.json).`;
     }
 
     if (captureControl === 'automatic') {
       return (
-        `${guidance} Rerun with --debug to save a .network.json capture and ` +
-        'print the automatic action trace.'
+        `${guidance} Rerun with --debug to save a diagnostic capture ` +
+        '(.network.json) and print the automatic action trace.'
       );
     }
 
     return (
-      `${guidance} Rerun with --debug to save a .network.json capture and ` +
-      'auto-reload the page once capture is armed.'
+      `${guidance} Rerun with --debug to save a diagnostic capture ` +
+      '(.network.json) and auto-reload the page after capture starts.'
     );
   }
   
@@ -6960,13 +7361,13 @@ const runEmbeddedNetworkMode = (() => {
       tempDataDir = join(tmpdir(), `stream-transcript-extractor-network-${Date.now()}`);
       mkdirSync(tempDataDir, { recursive: true });
   
-      console.log('Preparing temporary browser profile...');
+      console.log('Setting up a temporary browser session...');
       prepareTempProfile(browser.basePath, profile, tempDataDir);
-  
-      console.log(`Launching ${browser.name} on debug port ${debugPort}...`);
+
+      console.log(`Starting ${browser.name}...`);
       browserProcess = launchBrowser(browser, profile, tempDataDir, debugPort);
-  
-      console.log('Waiting for the browser debug endpoint...');
+
+      console.log('Waiting for the browser window to finish opening...');
       await waitForBrowserDebugEndpoint(debugPort);
       await waitForBrowserPageTarget(debugPort);
 
@@ -6986,20 +7387,19 @@ const runEmbeddedNetworkMode = (() => {
         }
 
         targetPage = await selectTranscriptPage(prompt, debugPort);
-        console.log(`\nConnecting to: ${targetPage.title}`);
+        console.log(`\nUsing tab: ${targetPage.title}`);
 
         cdp = await connectToPage(targetPage.webSocketDebuggerUrl);
         await cdp.send('Runtime.enable');
 
         console.log(
           captureControl === 'automatic'
-            ? 'Capturing transcript-related network responses in automatic mode...'
-            : 'Capturing transcript-related network responses...',
+            ? 'Listening for transcript data in automatic mode...'
+            : 'Listening for transcript data...',
         );
         if (options.debug) {
           console.log(
-            'Debug capture enabled: saving request/response lifecycle data, ' +
-              'candidate bodies, and WebSocket frames.',
+            'Debug capture is on. Extra diagnostic files will be saved for troubleshooting.',
           );
         }
         const captureResult = await captureStreamNetwork(
@@ -7036,11 +7436,11 @@ const runEmbeddedNetworkMode = (() => {
         let networkOutputPath = '';
 
         console.log(
-          `Observed ${captureResult.candidates.length} potentially relevant network response` +
+          `Found ${captureResult.candidates.length} possible transcript response` +
             `${captureResult.candidates.length === 1 ? '' : 's'}.`,
         );
         console.log(
-          `Parsed ${captureResult.transcriptMatchCount || 0} transcript payload match` +
+          `Parsed ${captureResult.transcriptMatchCount || 0} transcript match` +
             `${captureResult.transcriptMatchCount === 1 ? '' : 'es'}.`,
         );
 
@@ -7058,7 +7458,7 @@ const runEmbeddedNetworkMode = (() => {
               networkCapturePayload,
               outputBasePath,
             );
-            console.log(`Saved network capture to: ${networkOutputPath}`);
+            console.log(`Saved diagnostic capture: ${networkOutputPath}`);
           }
 
           throw new CliError(
@@ -7098,10 +7498,10 @@ const runEmbeddedNetworkMode = (() => {
         );
         console.log(`Parsed ${entries.length} transcript entries.`);
         for (const outputPath of outputPaths) {
-          console.log(`Saved transcript to: ${outputPath}`);
+          console.log(`Saved transcript file: ${outputPath}`);
         }
         if (networkOutputPath) {
-          console.log(`Saved network capture to: ${networkOutputPath}`);
+          console.log(`Saved diagnostic capture: ${networkOutputPath}`);
         }
 
         hasCompletedExtraction = true;
@@ -7144,7 +7544,13 @@ const runEmbeddedNetworkMode = (() => {
 })();
 
 async function runSelectedMode() {
-  const { mode, forwardedArgs } = resolveExtractorMode(process.argv.slice(2));
+  const rawArgs = process.argv.slice(2);
+  let { mode, forwardedArgs } = resolveExtractorMode(rawArgs);
+
+  if (shouldUseGuidedSetup(rawArgs)) {
+    ({ mode, forwardedArgs } = await runGuidedSetup());
+  }
+
   const originalArgv = [...process.argv];
   process.argv = [originalArgv[0], originalArgv[1], ...forwardedArgs];
 
