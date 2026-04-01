@@ -15,11 +15,15 @@ This repository keeps the working surface deliberately small. You run
 That gives you one shareable source file for day-to-day extraction without
 turning the project into a multi-file application tree.
 
-The extractor supports two modes behind the same CLI:
+The extractor supports three modes behind the same CLI:
 
 - `network` is the default and recommended mode. It captures the Stream
   transcript payload directly, decrypts it when needed, and writes richer
   meeting metadata.
+- `automatic` builds on the network extractor. It reloads the page with
+  capture armed, tries to open the **Transcript** panel for you, nudges the
+  panel to trigger lazy loading, and only falls back to manual steps if the UI
+  automation cannot drive the page.
 - `dom` is the fallback mode. It extracts entries from the rendered transcript
   panel when you need UI-level debugging or when the network path is not
   usable.
@@ -45,9 +49,10 @@ more than any API credentials.
 
 ## Quick start
 
-The fastest path to a working extraction is the default `network` mode. It is
-the more reliable path for current Stream recordings because it reads the
-payload behind the transcript UI instead of depending on a virtualised DOM.
+The fastest path to a working extraction is the default `network` mode. If the
+manual timing is what slows you down, use `automatic` instead. Both rely on
+the transcript payload behind the UI, which is more reliable for current
+Stream recordings than scraping a virtualised DOM.
 
 1. Close Chrome or Edge completely.
 2. Run the extractor from the repository root.
@@ -68,16 +73,17 @@ Markdown, add `--format md` or `--format both`.
 
 ## Choose a mode
 
-Both modes solve the same user problem, but they optimise for different kinds
+All three modes solve the same user problem, but they optimise for different kinds
 of stability and debugging. The single entrypoint is stable. The workflow
 changes only after you choose a mode.
 
 ### Network mode
 
 `network` mode is the default. It watches Microsoft Stream's in-browser
-requests, extracts the transcript payload, and writes a companion
-`.network.json` capture file that helps with debugging and cross-browser
-comparison.
+requests, extracts the transcript payload, prints a terminal confirmation when
+it sees likely transcript traffic, and writes a companion `.network.json`
+capture file on successful runs. Failed runs only save that capture file when
+you use `--debug`.
 
 Use it when you want:
 
@@ -95,6 +101,33 @@ bun ./extract.js --mode network --debug
 
 In `network` mode, open the recording page first with the **Transcript** panel
 closed. Only open the panel after the extractor says capture is armed.
+
+### Automatic mode
+
+`automatic` mode uses the same network capture path as `network`, but it takes
+over the timing-sensitive UI steps after the page is selected. It reloads the
+page with capture armed, tries to open the **Transcript** panel, nudges the
+panel to trigger lazy loading, waits for transcript-like traffic, and only
+falls back to manual input if it cannot drive the Stream UI.
+
+Use it when you want:
+
+- the network extractor without the manual panel-open timing
+- a safer default when Stream is inconsistent about when it fires transcript
+  requests
+- automatic retries before you have to intervene yourself
+
+Use it like this:
+
+```bash
+bun ./extract.js --mode automatic
+bun ./extract.js --mode automatic --debug
+```
+
+In `automatic` mode, open the recording page and return to the terminal. The
+extractor handles the reload and transcript-panel actions after capture is
+armed. With `--debug`, it prints each automatic action, whether it succeeded,
+and when it falls back to manual assistance.
 
 ### DOM mode
 
@@ -130,6 +163,7 @@ bun ./extract.js
 
 # Force a mode
 bun ./extract.js --mode network
+bun ./extract.js --mode automatic
 bun ./extract.js --mode dom
 
 # Pick a browser
@@ -161,7 +195,7 @@ The supported options are:
 
 | Option | Purpose |
 | --- | --- |
-| `--mode <network\|dom>` | Choose the extractor mode. `network` is the default. |
+| `--mode <network\|automatic\|dom>` | Choose the extractor mode. `network` is the default. |
 | `--browser <chrome\|edge>` | Use a specific browser instead of choosing interactively. |
 | `--profile <query>` | Match a profile by name, email, or directory name. |
 | `--output <name>` | Override the output filename prefix. |
@@ -175,11 +209,13 @@ The supported options are:
 
 ## What gets written
 
-Each run can write JSON, Markdown, or both. In `network` mode, the extractor
-also writes a `.network.json` capture file. In `dom` mode, `--debug` writes a
-`.debug.json` file. The transcript outputs stay intentionally simple so they
-work for review, archive, LLM input, or diffing across browsers and operating
-systems.
+Each run can write JSON, Markdown, or both. In `network` mode, successful runs
+also write a `.network.json` capture file. Failed `network` runs only save that
+file when you use `--debug`. `automatic` mode writes the same `.network.json`
+files because it uses the same payload capture path. In `dom` mode, `--debug`
+writes a `.debug.json` file. The transcript outputs stay intentionally simple
+so they work for review, archive, LLM input, or diffing across browsers and
+operating systems.
 
 ### JSON transcript output
 
@@ -246,9 +282,12 @@ Whether it is ChatGPT or Gemini, that is more of an SEO problem.
 The diagnostic files are mode-specific. They are intended to make course
 correction practical when Stream changes its transport or rendering behaviour.
 
-- `network` mode always writes `*.network.json`
-- `network` mode with `--debug` writes larger captures with more request and
-  response detail
+- `network` mode writes `*.network.json` after a successful extraction
+- `network` mode with `--debug` also writes `*.network.json` on failed
+  captures, with larger request and response detail
+- `automatic` mode writes the same `*.network.json` outputs as `network`
+- `automatic` mode with `--debug` also prints the UI action trace for each
+  automatic open, retry, and fallback step
 - `dom` mode with `--debug` writes `*.debug.json`
 
 ## How it works

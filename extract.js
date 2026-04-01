@@ -23,7 +23,7 @@ const APP_DESCRIPTION =
   'Extract Microsoft Teams recording transcripts from Microsoft Stream ' +
   'using your signed-in Chrome or Edge profile.';
 const DEFAULT_EXTRACTOR_MODE = 'network';
-const SUPPORTED_EXTRACTOR_MODES = ['network', 'dom'];
+const SUPPORTED_EXTRACTOR_MODES = ['network', 'automatic', 'dom'];
 const SUPPORTED_BROWSER_KEYS = ['chrome', 'edge'];
 const SUPPORTED_OUTPUT_FORMATS = ['json', 'md', 'both'];
 const DEFAULT_OUTPUT_DIR = 'output';
@@ -278,7 +278,7 @@ function printEntrypointHelp() {
   console.log('  ./<compiled-binary> [options]\n');
   console.log('Options:');
   console.log(
-    `  --mode <network|dom>     Choose the extractor mode (default: ${DEFAULT_EXTRACTOR_MODE}).`,
+    `  --mode <network|automatic|dom>  Choose the extractor mode (default: ${DEFAULT_EXTRACTOR_MODE}).`,
   );
   console.log('  --browser <chrome|edge>  Use a specific browser.');
   console.log('  --profile <query>        Match a profile by name, email, or directory.');
@@ -286,23 +286,39 @@ function printEntrypointHelp() {
   console.log('  --output-dir <path>      Write output files to a custom directory.');
   console.log('  --format <json|md|both>  Choose JSON, Markdown, or both outputs.');
   console.log('  --debug-port <port>      Force a specific remote-debugging port.');
-  console.log('  --debug                  Write extra diagnostics for the selected mode.');
+  console.log(
+    '  --debug                  Write extra diagnostics. In automatic mode this also',
+  );
+  console.log(
+    '                           prints each UI action, retry, and fallback reason.',
+  );
   console.log('  --keep-browser-open      Leave the launched browser open after extraction.');
   console.log('  --version, -v            Print the build version.');
   console.log('  --help, -h               Show this help text.\n');
   console.log('Mode flow:');
   console.log(
-    '  network  Open the Stream page first with the Transcript panel closed.',
+    '  network    Open the Stream page first with the Transcript panel closed.',
   );
   console.log(
-    '           After capture is armed, open the Transcript panel and let it load.',
+    '             After capture is armed, open the Transcript panel and let it load.',
   );
   console.log(
-    '  dom      Open the Stream page and Transcript panel before extraction starts.\n',
+    '  automatic Reload with capture armed, try to open the Transcript panel,',
+  );
+  console.log(
+    '             nudge/retry automatically, then explain the fallback if manual',
+  );
+  console.log(
+    '             help is still needed.',
+  );
+  console.log(
+    '  dom        Open the Stream page and Transcript panel before extraction starts.\n',
   );
   console.log('Examples:');
   console.log('  bun extract.js');
   console.log('  bun extract.js --mode network --debug');
+  console.log('  bun extract.js --mode automatic');
+  console.log('  bun extract.js --mode automatic --debug');
   console.log('  bun extract.js --mode dom --format md');
 }
 
@@ -2240,9 +2256,16 @@ const runEmbeddedNetworkMode = (() => {
   const DEFAULT_CDP_TIMEOUT_MS = 30_000;
   const DEFAULT_CAPTURE_SETTLE_MS = 1_500;
   const DEFAULT_BROWSER_SHUTDOWN_TIMEOUT_MS = 8_000;
+  const DEFAULT_AUTOMATIC_UI_POLL_MS = 250;
+  const DEFAULT_AUTOMATIC_PANEL_OPEN_TIMEOUT_MS = 7_500;
+  const DEFAULT_AUTOMATIC_SIGNAL_TIMEOUT_MS = 8_000;
+  const DEFAULT_AUTOMATIC_SIGNAL_RETRY_TIMEOUT_MS = 6_000;
+  const DEFAULT_AUTOMATIC_REQUEST_SETTLE_TIMEOUT_MS = 8_000;
+  const DEFAULT_AUTOMATIC_CLICK_SETTLE_MS = 750;
   const MAX_TRACKED_RESPONSES = 150;
   const MAX_CANDIDATE_PREVIEW_LENGTH = 4_000;
   const MAX_SAVED_CANDIDATES = 40;
+  const LIVE_TRANSCRIPT_SIGNAL_SCORE = 6;
   const MAX_DEBUG_REQUESTS = 1_000;
   const MAX_DEBUG_RESPONSES = 1_000;
   const MAX_DEBUG_BODIES = 150;
@@ -2430,7 +2453,7 @@ const runEmbeddedNetworkMode = (() => {
     console.log(`${APP_NAME}`);
     console.log(`${APP_DESCRIPTION}\n`);
     console.log('Usage:');
-    console.log('  bun extract.js --mode network [options]');
+    console.log('  bun extract.js --mode <network|automatic> [options]');
     console.log('  ./<compiled-binary> [options]\n');
     console.log('Options:');
     console.log('  --browser <chrome|edge>  Use a specific browser.');
@@ -2443,15 +2466,27 @@ const runEmbeddedNetworkMode = (() => {
       '  --debug                  Save extended network diagnostics, including ' +
         'request/response lifecycle data, candidate bodies, and WebSocket frames.',
     );
+    console.log(
+      '                           In automatic mode, --debug also prints each UI',
+    );
+    console.log(
+      '                           action, retry, and fallback reason.',
+    );
     console.log('  --keep-browser-open      Leave the launched browser open after extraction.');
     console.log('  --version, -v            Print the build version.');
     console.log('  --help, -h               Show this help text.\n');
-    console.log('Network flow:');
+    console.log('Capture flow:');
     console.log(
-      '  Open the Stream page first with the Transcript panel closed.',
+      '  network: open the Stream page first with the Transcript panel closed.',
     );
     console.log(
-      '  After capture is armed, open the Transcript panel and let it load.',
+      '  automatic: let the extractor reload the page, try the Transcript panel',
+    );
+    console.log(
+      '             automatically, retry the panel actions, then explain any',
+    );
+    console.log(
+      '             manual fallback before it asks for help.',
     );
   }
   
@@ -3511,6 +3546,46 @@ const runEmbeddedNetworkMode = (() => {
     }
   
     return score;
+  }
+
+  function isLikelyTranscriptResponseSignal({
+    url,
+    mimeType,
+    contentType,
+    resourceType,
+    score,
+  }) {
+    const haystack = [url, mimeType, contentType, resourceType]
+      .join(' ')
+      .toLowerCase();
+
+    return (
+      isEncryptedTranscriptUrl(url) ||
+      containsTranscriptSignal(haystack) ||
+      score >= LIVE_TRANSCRIPT_SIGNAL_SCORE
+    );
+  }
+
+  function formatNetworkResponseForTerminal({
+    url,
+    resourceType,
+    mimeType,
+    contentType,
+  }) {
+    let displayUrl = String(url || '');
+
+    try {
+      const parsed = new URL(displayUrl);
+      displayUrl = `${parsed.pathname}${parsed.search}`;
+    } catch {
+      // Fall back to the raw URL when parsing fails.
+    }
+
+    const typeLabel = [resourceType, mimeType || contentType]
+      .filter(Boolean)
+      .join(', ');
+    const preview = trimForPreview(displayUrl, 140);
+    return typeLabel ? `${preview} [${typeLabel}]` : preview;
   }
   
   function tryParseJson(value) {
@@ -4613,9 +4688,16 @@ const runEmbeddedNetworkMode = (() => {
     );
   }
   
-  function printInitialRunInstructions() {
+  function printInitialRunInstructions(captureControl = 'manual') {
     console.log('\nBrowser is ready.');
     console.log('1. Open the meeting in Microsoft Stream.');
+    if (captureControl === 'automatic') {
+      console.log(
+        '2. Return to this terminal and continue. The extractor will reload the page and manage the Transcript panel automatically.',
+      );
+      return;
+    }
+
     console.log('2. Leave the Transcript panel closed for now.');
     console.log('3. Return to this terminal and continue so capture can be armed.');
   }
@@ -4627,14 +4709,870 @@ const runEmbeddedNetworkMode = (() => {
       console.log('2. Open the Transcript panel in Microsoft Stream.');
       console.log('3. If the panel is already open, close and reopen it if possible.');
       console.log('4. Let the transcript load, and scroll once if the app lazily fetches chunks.');
-      console.log('5. Return to this terminal and press Enter.');
+      console.log(
+        '5. Watch this terminal for a transcript-traffic confirmation if one is seen.',
+      );
+      console.log('6. Return to this terminal and press Enter.');
       return;
     }
   
     console.log('1. Open the Transcript panel in Microsoft Stream.');
     console.log('2. If the panel is already open, close and reopen it if possible.');
     console.log('3. Let the transcript load, and scroll once if the app lazily fetches chunks.');
+    console.log(
+      '4. Watch this terminal for a transcript-traffic confirmation if one is seen.',
+    );
+    console.log('5. Return to this terminal and press Enter.');
+  }
+
+  function printAutomaticFallbackInstructions() {
+    console.log('\nAutomatic mode needs a manual assist.');
+    console.log('1. Open or reopen the Transcript panel in Microsoft Stream.');
+    console.log('2. Let the transcript load, and scroll once if the app lazily fetches chunks.');
+    console.log(
+      '3. Watch this terminal for a transcript-traffic confirmation if one is seen.',
+    );
     console.log('4. Return to this terminal and press Enter.');
+  }
+
+  function buildTranscriptPanelAutomationExpression(action = 'inspect') {
+    const serializedAction = JSON.stringify(action);
+
+    return `
+      (() => {
+        const action = ${serializedAction};
+
+        function normalizeText(value) {
+          return String(value || '').replace(/\\s+/g, ' ').trim();
+        }
+
+        function isVisible(element) {
+          if (!(element instanceof HTMLElement)) {
+            return false;
+          }
+
+          const style = window.getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          return (
+            style.display !== 'none' &&
+            style.visibility !== 'hidden' &&
+            rect.width > 1 &&
+            rect.height > 1
+          );
+        }
+
+        function buildLabel(element) {
+          return normalizeText(
+            [
+              element.getAttribute('aria-label'),
+              element.getAttribute('title'),
+              element.getAttribute('data-tid'),
+              element.getAttribute('name'),
+              element.textContent,
+            ]
+              .filter(Boolean)
+              .join(' '),
+          );
+        }
+
+        function isTranscriptLabel(text) {
+          return /\\b(transcript|captions?|subtitles?)\\b/i.test(text);
+        }
+
+        function looksLikeTranscriptContainer(element) {
+          if (!(element instanceof HTMLElement) || !isVisible(element)) {
+            return false;
+          }
+
+          const overflowY = window.getComputedStyle(element).overflowY;
+          const sampleText = normalizeText(
+            element.innerText || element.textContent || '',
+          ).slice(0, 800);
+
+          return (
+            (overflowY === 'auto' || overflowY === 'scroll') &&
+            element.scrollHeight > element.clientHeight + 20 &&
+            element.clientHeight > 80 &&
+            (/\\d{1,2}:\\d{2}/.test(sampleText) ||
+              /\\b(?:started|stopped) transcription\\b/i.test(sampleText))
+          );
+        }
+
+        function findTranscriptContainer() {
+          for (const element of document.querySelectorAll('*')) {
+            if (looksLikeTranscriptContainer(element)) {
+              return element;
+            }
+          }
+
+          return null;
+        }
+
+        function scoreControl(element) {
+          const label = buildLabel(element);
+          if (!label || !isTranscriptLabel(label)) {
+            return -1;
+          }
+
+          const lowerLabel = label.toLowerCase();
+          let score = 0;
+
+          if (element.tagName === 'BUTTON') {
+            score += 4;
+          }
+
+          const role = String(element.getAttribute('role') || '').toLowerCase();
+          if (role === 'button') {
+            score += 3;
+          } else if (role === 'tab' || role === 'menuitem') {
+            score += 2;
+          }
+
+          if (/^(transcript|captions?|subtitles?)$/.test(lowerLabel)) {
+            score += 10;
+          }
+
+          if (/\\b(open|show|view)\\s+(the\\s+)?(transcript|captions?|subtitles?)\\b/.test(lowerLabel)) {
+            score += 9;
+          }
+
+          if (/\\b(hide|close)\\s+(the\\s+)?(transcript|captions?|subtitles?)\\b/.test(lowerLabel)) {
+            score += 8;
+          }
+
+          if (
+            String(element.getAttribute('aria-controls') || '')
+              .toLowerCase()
+              .includes('transcript')
+          ) {
+            score += 4;
+          }
+
+          if (String(element.getAttribute('data-tid') || '').toLowerCase().includes('transcript')) {
+            score += 4;
+          }
+
+          if (String(element.getAttribute('aria-expanded') || '') === 'false') {
+            score += action === 'open' ? 2 : 0;
+          }
+
+          if (String(element.getAttribute('aria-expanded') || '') === 'true') {
+            score += action === 'close' ? 2 : 0;
+          }
+
+          if (label.length <= 80) {
+            score += 1;
+          }
+
+          return score;
+        }
+
+        function findBestControl() {
+          const selectors = [
+            'button',
+            '[role="button"]',
+            '[role="tab"]',
+            '[role="menuitem"]',
+            '[aria-label]',
+            '[data-tid]',
+          ];
+          const elements = new Set();
+
+          for (const selector of selectors) {
+            document.querySelectorAll(selector).forEach((element) =>
+              elements.add(element),
+            );
+          }
+
+          let bestControl = null;
+          let bestScore = -1;
+
+          for (const element of elements) {
+            if (!(element instanceof HTMLElement) || !isVisible(element)) {
+              continue;
+            }
+
+            const score = scoreControl(element);
+            if (score > bestScore) {
+              bestScore = score;
+              bestControl = element;
+            }
+          }
+
+          return bestControl;
+        }
+
+        function clickElement(element) {
+          if (!(element instanceof HTMLElement) || element.hasAttribute('disabled')) {
+            return false;
+          }
+
+          try {
+            element.scrollIntoView({
+              block: 'center',
+              inline: 'center',
+            });
+          } catch {
+            // Ignore scroll failures and keep trying to click.
+          }
+
+          try {
+            for (const eventName of [
+              'pointerdown',
+              'mousedown',
+              'pointerup',
+              'mouseup',
+              'click',
+            ]) {
+              element.dispatchEvent(
+                new MouseEvent(eventName, {
+                  bubbles: true,
+                  cancelable: true,
+                  view: window,
+                }),
+              );
+            }
+            element.click();
+            return true;
+          } catch {
+            try {
+              element.click();
+              return true;
+            } catch {
+              return false;
+            }
+          }
+        }
+
+        const container = findTranscriptContainer();
+        const control = findBestControl();
+        const controlLabel = control ? buildLabel(control) : '';
+        const controlExpanded = control
+          ? String(control.getAttribute('aria-expanded') || '')
+          : '';
+        const result = {
+          action,
+          panelOpen: Boolean(container),
+          panelLikelyOpen: Boolean(container) || controlExpanded === 'true',
+          controlFound: Boolean(control),
+          controlLabel,
+          controlExpanded,
+          scrollTop: container ? container.scrollTop : 0,
+          clientHeight: container ? container.clientHeight : 0,
+          scrollHeight: container ? container.scrollHeight : 0,
+        };
+
+        if (action === 'inspect') {
+          return result;
+        }
+
+        if (action === 'open') {
+          if (result.panelLikelyOpen) {
+            return {
+              ...result,
+              ok: true,
+              performed: 'already-open',
+            };
+          }
+
+          if (!control) {
+            return {
+              ...result,
+              ok: false,
+              performed: 'missing-control',
+            };
+          }
+
+          return {
+            ...result,
+            ok: clickElement(control),
+            performed: 'clicked-open',
+          };
+        }
+
+        if (action === 'close') {
+          if (!result.panelLikelyOpen) {
+            return {
+              ...result,
+              ok: true,
+              performed: 'already-closed',
+            };
+          }
+
+          if (!control) {
+            return {
+              ...result,
+              ok: false,
+              performed: 'missing-control',
+            };
+          }
+
+          return {
+            ...result,
+            ok: clickElement(control),
+            performed: 'clicked-close',
+          };
+        }
+
+        if (action === 'nudge-scroll') {
+          if (!container) {
+            return {
+              ...result,
+              ok: false,
+              performed: 'missing-container',
+            };
+          }
+
+          const beforeScrollTop = container.scrollTop;
+          const maxScrollTop = Math.max(
+            0,
+            container.scrollHeight - container.clientHeight,
+          );
+          const targetScrollTop =
+            maxScrollTop > 0
+              ? Math.min(
+                  maxScrollTop,
+                  Math.max(
+                    beforeScrollTop + Math.floor(container.clientHeight * 1.5),
+                    Math.floor(maxScrollTop * 0.6),
+                  ),
+                )
+              : 0;
+          container.scrollTop =
+            targetScrollTop === beforeScrollTop && maxScrollTop > 0
+              ? maxScrollTop
+              : targetScrollTop;
+
+          return {
+            ...result,
+            ok: true,
+            performed: 'nudged-scroll',
+            beforeScrollTop,
+            afterScrollTop: container.scrollTop,
+          };
+        }
+
+        return {
+          ...result,
+          ok: false,
+          performed: 'unsupported-action',
+        };
+      })()
+    `;
+  }
+
+  async function waitForAsyncCondition(
+    check,
+    timeoutMs,
+    pollMs = DEFAULT_AUTOMATIC_UI_POLL_MS,
+  ) {
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      const result = await check();
+      if (result) {
+        return result;
+      }
+
+      await sleep(pollMs);
+    }
+
+    return null;
+  }
+
+  function summarizeTranscriptPanelUiState(state) {
+    if (!state) {
+      return null;
+    }
+
+    return {
+      panelOpen: Boolean(state.panelOpen),
+      panelLikelyOpen: Boolean(state.panelLikelyOpen),
+      controlFound: Boolean(state.controlFound),
+      controlLabel: state.controlLabel || '',
+      controlExpanded: state.controlExpanded || '',
+      scrollTop:
+        typeof state.scrollTop === 'number' ? state.scrollTop : null,
+      clientHeight:
+        typeof state.clientHeight === 'number' ? state.clientHeight : null,
+      scrollHeight:
+        typeof state.scrollHeight === 'number' ? state.scrollHeight : null,
+      performed: state.performed || '',
+      ok: typeof state.ok === 'boolean' ? state.ok : null,
+    };
+  }
+
+  function logAutomaticAction(
+    captureFeedback,
+    debugEnabled,
+    step,
+    details = null,
+  ) {
+    const entry = {
+      at: new Date().toISOString(),
+      step,
+      details,
+    };
+
+    captureFeedback.automaticActions.push(entry);
+    if (!debugEnabled) {
+      return;
+    }
+
+    const detailSuffix = details ? ` ${JSON.stringify(details)}` : '';
+    console.log(`[automatic debug] ${step}${detailSuffix}`);
+  }
+
+  function countAutomaticActions(captureFeedback, prefix) {
+    return captureFeedback.automaticActions.filter((entry) =>
+      entry.step.startsWith(prefix),
+    ).length;
+  }
+
+  function buildAutomaticFallbackSummary(
+    reason,
+    captureFeedback,
+    panelResult = null,
+  ) {
+    const lines = [];
+    const state = panelResult?.state || null;
+    const controlLabel = panelResult?.controlLabel || state?.controlLabel || '';
+    const openAttempts = countAutomaticActions(
+      captureFeedback,
+      'open transcript panel attempt',
+    );
+    const nudgeAttempts = countAutomaticActions(
+      captureFeedback,
+      'nudge transcript panel',
+    );
+
+    if (reason === 'panel-open-failed') {
+      if (state?.controlFound) {
+        lines.push(
+          controlLabel
+            ? `I found a likely Transcript control ("${controlLabel}") but the panel did not appear to open.`
+            : 'I found a likely Transcript control, but the panel did not appear to open.',
+        );
+      } else {
+        lines.push(
+          'I could not find a visible Transcript control to click on this page.',
+        );
+      }
+    } else if (reason === 'traffic-not-detected') {
+      if (state?.panelLikelyOpen) {
+        lines.push(
+          'I was able to get what looked like an open Transcript panel.',
+        );
+      } else if (state?.controlFound) {
+        lines.push(
+          controlLabel
+            ? `I found and tried the likely Transcript control ("${controlLabel}"), but I could not confirm that the panel stayed open.`
+            : 'I found and tried a likely Transcript control, but I could not confirm that the panel stayed open.',
+        );
+      } else {
+        lines.push(
+          'I did not reliably confirm an open Transcript panel before capture timed out.',
+        );
+      }
+
+      if (captureFeedback.transcriptHintCount > 0) {
+        lines.push(
+          `I saw ${captureFeedback.transcriptHintCount} transcript-like network response` +
+            `${captureFeedback.transcriptHintCount === 1 ? '' : 's'}, but none produced a usable transcript payload yet.`,
+        );
+      } else if (captureFeedback.candidateResponseCount > 0) {
+        lines.push(
+          `I saw ${captureFeedback.candidateResponseCount} potentially relevant network response` +
+            `${captureFeedback.candidateResponseCount === 1 ? '' : 's'}, but none looked transcript-specific.`,
+        );
+      } else {
+        lines.push(
+          'I did not see any transcript-like network responses after the automatic panel actions.',
+        );
+      }
+    }
+
+    const attemptedActions = [];
+    if (panelResult?.refreshed) {
+      attemptedActions.push('refreshed the panel state');
+    }
+    if (openAttempts > 0) {
+      attemptedActions.push(
+        `${openAttempts} open attempt${openAttempts === 1 ? '' : 's'}`,
+      );
+    }
+    if (nudgeAttempts > 0) {
+      attemptedActions.push(
+        `${nudgeAttempts} scroll nudge${nudgeAttempts === 1 ? '' : 's'}`,
+      );
+    }
+
+    if (attemptedActions.length > 0) {
+      lines.push(`Automatic actions attempted: ${attemptedActions.join(', ')}.`);
+    }
+
+    return lines;
+  }
+
+  function printAutomaticFallbackSummary(
+    reason,
+    captureFeedback,
+    panelResult = null,
+  ) {
+    const lines = buildAutomaticFallbackSummary(
+      reason,
+      captureFeedback,
+      panelResult,
+    );
+
+    if (lines.length === 0) {
+      return;
+    }
+
+    console.log('Automatic mode summary:');
+    for (const line of lines) {
+      console.log(`- ${line}`);
+    }
+  }
+
+  async function inspectTranscriptPanelUi(cdp) {
+    return evaluate(cdp, buildTranscriptPanelAutomationExpression('inspect'));
+  }
+
+  async function performTranscriptPanelAction(cdp, action) {
+    return evaluate(cdp, buildTranscriptPanelAutomationExpression(action));
+  }
+
+  async function waitForTranscriptPanelToOpen(
+    cdp,
+    timeoutMs = DEFAULT_AUTOMATIC_PANEL_OPEN_TIMEOUT_MS,
+  ) {
+    return waitForAsyncCondition(
+      async () => {
+        const state = await inspectTranscriptPanelUi(cdp);
+        return state.panelLikelyOpen ? state : null;
+      },
+      timeoutMs,
+    );
+  }
+
+  async function ensureTranscriptPanelOpenAutomatically(
+    cdp,
+    captureFeedback,
+    debugEnabled,
+    { refreshIfOpen = false } = {},
+  ) {
+    const initialState = await inspectTranscriptPanelUi(cdp);
+    logAutomaticAction(
+      captureFeedback,
+      debugEnabled,
+      'inspect transcript panel',
+      summarizeTranscriptPanelUiState(initialState),
+    );
+    let refreshed = false;
+
+    if (initialState.panelLikelyOpen && !refreshIfOpen) {
+      return {
+        opened: true,
+        refreshed,
+        controlLabel: initialState.controlLabel || '',
+        state: initialState,
+      };
+    }
+
+    if (initialState.panelLikelyOpen && refreshIfOpen) {
+      const closeResult = await performTranscriptPanelAction(cdp, 'close');
+      logAutomaticAction(
+        captureFeedback,
+        debugEnabled,
+        'close transcript panel',
+        summarizeTranscriptPanelUiState(closeResult),
+      );
+      if (closeResult.ok) {
+        refreshed = true;
+        await sleep(DEFAULT_AUTOMATIC_CLICK_SETTLE_MS);
+      }
+    }
+
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const openResult = await performTranscriptPanelAction(cdp, 'open');
+      logAutomaticAction(
+        captureFeedback,
+        debugEnabled,
+        `open transcript panel attempt ${attempt}`,
+        summarizeTranscriptPanelUiState(openResult),
+      );
+      if (!openResult.controlFound && !openResult.panelLikelyOpen) {
+        return {
+          opened: false,
+          refreshed,
+          controlLabel: '',
+          state: openResult,
+        };
+      }
+
+      await sleep(DEFAULT_AUTOMATIC_CLICK_SETTLE_MS);
+      const openState = await waitForTranscriptPanelToOpen(cdp);
+      logAutomaticAction(
+        captureFeedback,
+        debugEnabled,
+        `wait for transcript panel attempt ${attempt}`,
+        summarizeTranscriptPanelUiState(openState),
+      );
+      if (openState?.panelLikelyOpen) {
+        return {
+          opened: true,
+          refreshed,
+          controlLabel: openResult.controlLabel || openState.controlLabel || '',
+          state: openState,
+        };
+      }
+    }
+
+    const finalState = await inspectTranscriptPanelUi(cdp);
+    logAutomaticAction(
+      captureFeedback,
+      debugEnabled,
+      'inspect transcript panel after retries',
+      summarizeTranscriptPanelUiState(finalState),
+    );
+    return {
+      opened: Boolean(finalState?.panelLikelyOpen),
+      refreshed,
+      controlLabel: finalState?.controlLabel || '',
+      state: finalState,
+    };
+  }
+
+  async function nudgeTranscriptPanelAutomatically(
+    cdp,
+    captureFeedback,
+    debugEnabled,
+  ) {
+    const nudgeResult = await performTranscriptPanelAction(cdp, 'nudge-scroll');
+    logAutomaticAction(
+      captureFeedback,
+      debugEnabled,
+      'nudge transcript panel',
+      summarizeTranscriptPanelUiState(nudgeResult),
+    );
+    return (
+      nudgeResult.ok &&
+      typeof nudgeResult.afterScrollTop === 'number' &&
+      nudgeResult.afterScrollTop > nudgeResult.beforeScrollTop
+    );
+  }
+
+  async function waitForTranscriptSignal(captureFeedback, timeoutMs) {
+    return waitForAsyncCondition(
+      async () =>
+        captureFeedback.transcriptHintCount > 0
+          ? {
+              candidateResponseCount: captureFeedback.candidateResponseCount,
+              transcriptHintCount: captureFeedback.transcriptHintCount,
+            }
+          : null,
+      timeoutMs,
+    );
+  }
+
+  async function waitForTranscriptSignalToSettle(captureFeedback, timeoutMs) {
+    return waitForAsyncCondition(
+      async () =>
+        captureFeedback.transcriptHintSettledCount > 0 ||
+        captureFeedback.transcriptHintFailedCount > 0
+          ? {
+              settledCount: captureFeedback.transcriptHintSettledCount,
+              failedCount: captureFeedback.transcriptHintFailedCount,
+            }
+          : null,
+      timeoutMs,
+    );
+  }
+
+  async function runAutomaticTranscriptCaptureFlow(
+    cdp,
+    prompt,
+    captureFeedback,
+    debugEnabled,
+  ) {
+    console.log('\nAutomatic mode: reloading the page with capture armed...');
+    logAutomaticAction(captureFeedback, debugEnabled, 'reload page');
+    await reloadPageAndWait(cdp);
+
+    console.log('Automatic mode: locating the Transcript control...');
+    let panelResult = await ensureTranscriptPanelOpenAutomatically(
+      cdp,
+      captureFeedback,
+      debugEnabled,
+      {
+        refreshIfOpen: true,
+      },
+    );
+    logAutomaticAction(captureFeedback, debugEnabled, 'transcript panel result', {
+      opened: panelResult.opened,
+      refreshed: panelResult.refreshed,
+      controlLabel: panelResult.controlLabel || '',
+      state: summarizeTranscriptPanelUiState(panelResult.state),
+    });
+
+    if (!panelResult.opened) {
+      console.log(
+        'Automatic mode: could not open the Transcript panel automatically.',
+      );
+      printAutomaticFallbackSummary(
+        'panel-open-failed',
+        captureFeedback,
+        panelResult,
+      );
+      logAutomaticAction(
+        captureFeedback,
+        debugEnabled,
+        'automatic open failed, falling back to manual assist',
+      );
+      printAutomaticFallbackInstructions();
+      await prompt.waitForEnter(
+        '\nPress Enter after the transcript panel has loaded...\n',
+      );
+      await sleep(DEFAULT_CAPTURE_SETTLE_MS);
+      return;
+    }
+
+    console.log(
+      panelResult.refreshed
+        ? 'Automatic mode: refreshed and reopened the Transcript panel.'
+        : 'Automatic mode: opened the Transcript panel automatically.',
+    );
+    if (panelResult.controlLabel) {
+      console.log(`Automatic mode: using control "${panelResult.controlLabel}".`);
+    }
+
+    if (
+      await nudgeTranscriptPanelAutomatically(cdp, captureFeedback, debugEnabled)
+    ) {
+      console.log(
+        'Automatic mode: nudged the Transcript panel to trigger lazy loading.',
+      );
+    }
+
+    console.log('Automatic mode: waiting for transcript network traffic...');
+    logAutomaticAction(
+      captureFeedback,
+      debugEnabled,
+      'wait for transcript network traffic',
+      {
+        timeoutMs: DEFAULT_AUTOMATIC_SIGNAL_TIMEOUT_MS,
+      },
+    );
+    let transcriptSignal = await waitForTranscriptSignal(
+      captureFeedback,
+      DEFAULT_AUTOMATIC_SIGNAL_TIMEOUT_MS,
+    );
+
+    if (!transcriptSignal) {
+      console.log(
+        'Automatic mode: no transcript traffic yet. Nudging the panel once more.',
+      );
+      logAutomaticAction(
+        captureFeedback,
+        debugEnabled,
+        'transcript traffic not seen after first wait',
+      );
+      await nudgeTranscriptPanelAutomatically(cdp, captureFeedback, debugEnabled);
+      transcriptSignal = await waitForTranscriptSignal(
+        captureFeedback,
+        DEFAULT_AUTOMATIC_SIGNAL_RETRY_TIMEOUT_MS,
+      );
+    }
+
+    if (!transcriptSignal) {
+      console.log(
+        'Automatic mode: no transcript traffic after opening the panel. Retrying one panel refresh.',
+      );
+      logAutomaticAction(
+        captureFeedback,
+        debugEnabled,
+        'retry transcript panel refresh',
+      );
+      panelResult = await ensureTranscriptPanelOpenAutomatically(
+        cdp,
+        captureFeedback,
+        debugEnabled,
+        {
+          refreshIfOpen: true,
+        },
+      );
+      if (panelResult.opened) {
+        await nudgeTranscriptPanelAutomatically(cdp, captureFeedback, debugEnabled);
+        transcriptSignal = await waitForTranscriptSignal(
+          captureFeedback,
+          DEFAULT_AUTOMATIC_SIGNAL_RETRY_TIMEOUT_MS,
+        );
+      }
+    }
+
+    if (!transcriptSignal) {
+      console.log(
+        'Automatic mode: transcript traffic was not detected automatically.',
+      );
+      printAutomaticFallbackSummary(
+        'traffic-not-detected',
+        captureFeedback,
+        panelResult,
+      );
+      logAutomaticAction(
+        captureFeedback,
+        debugEnabled,
+        'automatic signal wait failed, falling back to manual assist',
+      );
+      printAutomaticFallbackInstructions();
+      await prompt.waitForEnter(
+        '\nPress Enter after the transcript panel has loaded...\n',
+      );
+      await sleep(DEFAULT_CAPTURE_SETTLE_MS);
+      return;
+    }
+
+    console.log(
+      `Automatic mode: observed ${transcriptSignal.transcriptHintCount} transcript-like network response` +
+        `${transcriptSignal.transcriptHintCount === 1 ? '' : 's'}.`,
+    );
+    logAutomaticAction(
+      captureFeedback,
+      debugEnabled,
+      'transcript traffic detected',
+      transcriptSignal,
+    );
+
+    const settledSignal = await waitForTranscriptSignalToSettle(
+      captureFeedback,
+      DEFAULT_AUTOMATIC_REQUEST_SETTLE_TIMEOUT_MS,
+    );
+    if (settledSignal) {
+      console.log(
+        'Automatic mode: transcript response activity settled. Continuing extraction.',
+      );
+      logAutomaticAction(
+        captureFeedback,
+        debugEnabled,
+        'transcript activity settled',
+        settledSignal,
+      );
+    } else {
+      console.log(
+        'Automatic mode: transcript traffic was seen, but the response did not fully settle before capture ended.',
+      );
+      logAutomaticAction(
+        captureFeedback,
+        debugEnabled,
+        'transcript activity did not settle before timeout',
+        {
+          timeoutMs: DEFAULT_AUTOMATIC_REQUEST_SETTLE_TIMEOUT_MS,
+        },
+      );
+    }
+
+    await sleep(DEFAULT_CAPTURE_SETTLE_MS);
   }
   
   async function loadResponseBody(cdp, requestId, bodyCache) {
@@ -4746,7 +5684,12 @@ const runEmbeddedNetworkMode = (() => {
     await sleep(1_000);
   }
   
-  async function captureStreamNetwork(cdp, prompt, debugEnabled = false) {
+  async function captureStreamNetwork(
+    cdp,
+    prompt,
+    debugEnabled = false,
+    captureControl = 'manual',
+  ) {
     await cdp.send('Network.enable', {
       maxTotalBufferSize: 100_000_000,
       maxResourceBufferSize: 10_000_000,
@@ -4756,6 +5699,16 @@ const runEmbeddedNetworkMode = (() => {
     const finishedRequests = new Set();
     const failedRequests = new Map();
     const bodyCache = new Map();
+    const captureFeedback = {
+      candidateResponseCount: 0,
+      transcriptHintCount: 0,
+      transcriptHintSettledCount: 0,
+      transcriptHintFailedCount: 0,
+      firstTranscriptHint: null,
+      printedTranscriptHint: false,
+      automaticActions: [],
+    };
+    const transcriptHintRequestIds = new Set();
     const debugState = debugEnabled
       ? {
           requests: new Map(),
@@ -4822,10 +5775,11 @@ const runEmbeddedNetworkMode = (() => {
         const url = String(params.response.url || '');
         const mimeType = String(params.response.mimeType || '');
         const resourceType = String(params.type || '');
+        const contentType = String(lowerHeaders['content-type'] || '');
         const score = scoreNetworkResponse({
           url: url.toLowerCase(),
           mimeType: mimeType.toLowerCase(),
-          contentType: String(lowerHeaders['content-type'] || '').toLowerCase(),
+          contentType: contentType.toLowerCase(),
           contentDisposition: String(lowerHeaders['content-disposition'] || '').toLowerCase(),
           resourceType,
         });
@@ -4839,6 +5793,64 @@ const runEmbeddedNetworkMode = (() => {
           headers,
           score,
         });
+        captureFeedback.candidateResponseCount = trackedResponses.size;
+
+        if (
+          isLikelyTranscriptResponseSignal({
+            url,
+            mimeType,
+            contentType,
+            resourceType,
+            score,
+          })
+        ) {
+          transcriptHintRequestIds.add(requestId);
+          captureFeedback.transcriptHintCount += 1;
+          if (captureControl === 'automatic') {
+            logAutomaticAction(
+              captureFeedback,
+              debugEnabled,
+              'transcript hint response received',
+              {
+                requestId,
+                url,
+                resourceType,
+                mimeType,
+                contentType,
+                score,
+              },
+            );
+          }
+
+          if (!captureFeedback.firstTranscriptHint) {
+            captureFeedback.firstTranscriptHint = {
+              requestId,
+              url,
+              resourceType,
+              mimeType,
+              contentType,
+              score,
+            };
+          }
+
+          if (!captureFeedback.printedTranscriptHint) {
+            captureFeedback.printedTranscriptHint = true;
+            console.log(
+              `\nDetected likely transcript network response: ` +
+                `${formatNetworkResponseForTerminal({
+                  url,
+                  resourceType,
+                  mimeType,
+                  contentType,
+                })}`,
+            );
+            console.log(
+              captureControl === 'automatic'
+                ? 'Automatic mode will keep waiting for the response to settle.'
+                : 'Let the transcript finish loading, then press Enter to continue.',
+            );
+          }
+        }
       }
   
       if (!debugState) {
@@ -4948,6 +5960,19 @@ const runEmbeddedNetworkMode = (() => {
     const stopFinishedListener = cdp.on('Network.loadingFinished', (params) => {
       const requestId = String(params.requestId);
       finishedRequests.add(requestId);
+      if (transcriptHintRequestIds.has(requestId)) {
+        captureFeedback.transcriptHintSettledCount += 1;
+        if (captureControl === 'automatic') {
+          logAutomaticAction(
+            captureFeedback,
+            debugEnabled,
+            'transcript hint response finished',
+            {
+              requestId,
+            },
+          );
+        }
+      }
   
       if (!debugState) {
         return;
@@ -4967,6 +5992,20 @@ const runEmbeddedNetworkMode = (() => {
       const requestId = String(params.requestId);
       const errorText = params.errorText || 'Request failed';
       failedRequests.set(requestId, errorText);
+      if (transcriptHintRequestIds.has(requestId)) {
+        captureFeedback.transcriptHintFailedCount += 1;
+        if (captureControl === 'automatic') {
+          logAutomaticAction(
+            captureFeedback,
+            debugEnabled,
+            'transcript hint response failed',
+            {
+              requestId,
+              errorText,
+            },
+          );
+        }
+      }
   
       if (!debugState) {
         return;
@@ -5167,14 +6206,24 @@ const runEmbeddedNetworkMode = (() => {
       },
     );
   
-    if (debugEnabled) {
+    if (captureControl === 'automatic') {
+      await runAutomaticTranscriptCaptureFlow(
+        cdp,
+        prompt,
+        captureFeedback,
+        debugEnabled,
+      );
+    } else if (debugEnabled) {
       console.log('Reloading the page with capture armed...');
       await reloadPageAndWait(cdp);
+      printCaptureInstructions(debugEnabled);
+      await prompt.waitForEnter('\nPress Enter after the transcript panel has loaded...\n');
+      await sleep(DEFAULT_CAPTURE_SETTLE_MS);
+    } else {
+      printCaptureInstructions(debugEnabled);
+      await prompt.waitForEnter('\nPress Enter after the transcript panel has loaded...\n');
+      await sleep(DEFAULT_CAPTURE_SETTLE_MS);
     }
-  
-    printCaptureInstructions(debugEnabled);
-    await prompt.waitForEnter('\nPress Enter after the transcript panel has loaded...\n');
-    await sleep(DEFAULT_CAPTURE_SETTLE_MS);
   
     stopRequestListener();
     stopResponseListener();
@@ -5442,13 +6491,27 @@ const runEmbeddedNetworkMode = (() => {
   
       return right.score - left.score;
     });
+
+    const transcriptMatches = candidates.filter(
+      (candidate) => candidate.parsedEntryCount > 0,
+    );
   
     const matchedCandidate =
-      candidates.find((candidate) => candidate.parsedEntryCount > 0) || null;
+      transcriptMatches[0] || null;
   
     return {
       candidates,
       matchedCandidate,
+      transcriptMatchCount: transcriptMatches.length,
+      captureFeedback: {
+        candidateResponseCount: captureFeedback.candidateResponseCount,
+        transcriptHintCount: captureFeedback.transcriptHintCount,
+        transcriptHintSettledCount: captureFeedback.transcriptHintSettledCount,
+        transcriptHintFailedCount: captureFeedback.transcriptHintFailedCount,
+        firstTranscriptHint: captureFeedback.firstTranscriptHint,
+        automaticActions:
+          captureFeedback.automaticActions.slice(0, 200),
+      },
       debug,
     };
   }
@@ -5497,9 +6560,8 @@ const runEmbeddedNetworkMode = (() => {
       },
       summary: {
         candidateCount: captureResult.candidates.length,
-        transcriptMatches: captureResult.candidates.filter(
-          (candidate) => candidate.parsedEntryCount > 0,
-        ).length,
+        captureFeedback: captureResult.captureFeedback || null,
+        transcriptMatches: captureResult.transcriptMatchCount || 0,
         matchedCandidate: captureResult.matchedCandidate
           ? {
               url: captureResult.matchedCandidate.url,
@@ -5559,6 +6621,47 @@ const runEmbeddedNetworkMode = (() => {
       debug: options.debug ? captureResult.debug : undefined,
     };
   }
+
+  function buildMissingTranscriptCaptureMessage(
+    captureResult,
+    debugEnabled,
+    captureControl = 'manual',
+  ) {
+    const candidateResponseCount =
+      captureResult.captureFeedback?.candidateResponseCount || 0;
+    const transcriptHintCount =
+      captureResult.captureFeedback?.transcriptHintCount || 0;
+
+    let guidance =
+      'No transcript payload was observed after network capture started.';
+
+    if (candidateResponseCount === 0) {
+      guidance +=
+        ' No transcript-related network responses were captured while the terminal was armed.';
+    } else if (transcriptHintCount === 0) {
+      guidance +=
+        ' Some Stream responses were captured, but none looked transcript-specific.';
+    } else {
+      guidance +=
+        ' Transcript-like traffic was detected, but none of the captured bodies parsed into transcript entries.';
+    }
+
+    if (debugEnabled) {
+      return `${guidance} Review the saved .network.json capture.`;
+    }
+
+    if (captureControl === 'automatic') {
+      return (
+        `${guidance} Rerun with --debug to save a .network.json capture and ` +
+        'print the automatic action trace.'
+      );
+    }
+
+    return (
+      `${guidance} Rerun with --debug to save a .network.json capture and ` +
+      'auto-reload the page once capture is armed.'
+    );
+  }
   
   function handleError(error) {
     if (error instanceof CliError) {
@@ -5571,7 +6674,7 @@ const runEmbeddedNetworkMode = (() => {
     return 1;
   }
   
-  async function run() {
+  async function run(captureControl = 'manual') {
     const options = parseArgs(process.argv.slice(2));
   
     if (options.help) {
@@ -5615,7 +6718,7 @@ const runEmbeddedNetworkMode = (() => {
       await waitForBrowserDebugEndpoint(debugPort);
       await waitForBrowserPageTarget(debugPort);
   
-      printInitialRunInstructions();
+      printInitialRunInstructions(captureControl);
       await prompt.waitForEnter(
         '\nPress Enter once the Stream meeting page is open and ready...\n',
       );
@@ -5626,14 +6729,23 @@ const runEmbeddedNetworkMode = (() => {
       cdp = await connectToPage(targetPage.webSocketDebuggerUrl);
       await cdp.send('Runtime.enable');
   
-      console.log('Capturing transcript-related network responses...');
+      console.log(
+        captureControl === 'automatic'
+          ? 'Capturing transcript-related network responses in automatic mode...'
+          : 'Capturing transcript-related network responses...',
+      );
       if (options.debug) {
         console.log(
           'Debug capture enabled: saving request/response lifecycle data, ' +
             'candidate bodies, and WebSocket frames.',
         );
       }
-      const captureResult = await captureStreamNetwork(cdp, prompt, options.debug);
+      const captureResult = await captureStreamNetwork(
+        cdp,
+        prompt,
+        options.debug,
+        captureControl,
+      );
       const pageMetadata = await extractMeetingMetadata(cdp).catch(() => ({
         title: targetPage?.title || '',
         date: '',
@@ -5659,6 +6771,43 @@ const runEmbeddedNetworkMode = (() => {
         options.outputName,
         options.outputDir,
       );
+      let networkOutputPath = '';
+
+      console.log(
+        `Observed ${captureResult.candidates.length} potentially relevant network response` +
+          `${captureResult.candidates.length === 1 ? '' : 's'}.`,
+      );
+      console.log(
+        `Parsed ${captureResult.transcriptMatchCount || 0} transcript payload match` +
+          `${captureResult.transcriptMatchCount === 1 ? '' : 'es'}.`,
+      );
+
+      if (!captureResult.matchedCandidate) {
+        if (options.debug) {
+          const networkCapturePayload = buildNetworkCapturePayload({
+            options,
+            browser,
+            profile,
+            debugPort,
+            targetPage,
+            captureResult,
+          });
+          networkOutputPath = saveNetworkCaptureOutput(
+            networkCapturePayload,
+            outputBasePath,
+          );
+          console.log(`Saved network capture to: ${networkOutputPath}`);
+        }
+
+        throw new CliError(
+          buildMissingTranscriptCaptureMessage(
+            captureResult,
+            options.debug,
+            captureControl,
+          ),
+        );
+      }
+
       const networkCapturePayload = buildNetworkCapturePayload({
         options,
         browser,
@@ -5667,24 +6816,11 @@ const runEmbeddedNetworkMode = (() => {
         targetPage,
         captureResult,
       });
-      const networkOutputPath = saveNetworkCaptureOutput(
+      networkOutputPath = saveNetworkCaptureOutput(
         networkCapturePayload,
         outputBasePath,
       );
-  
-      console.log(
-        `Captured ${captureResult.candidates.length} candidate responses.`,
-      );
-  
-      if (!captureResult.matchedCandidate) {
-        console.log(`Saved network capture to: ${networkOutputPath}`);
-        throw new CliError(
-          'No transcript payload was observed after network capture started. ' +
-            'Review the saved .network.json capture. In --debug mode the tool ' +
-            'now reloads the page automatically once capture is armed.',
-        );
-      }
-  
+
       const entries = captureResult.matchedCandidate.parsedEntries;
       const outputPayload = buildOutputPayload(metadata, entries);
       const outputPaths = saveOutputs(
@@ -5730,8 +6866,8 @@ const runEmbeddedNetworkMode = (() => {
     }
   }
 
-  return async function runEmbeddedNetworkMode() {
-    return run();
+  return async function runEmbeddedNetworkMode(captureControl = 'manual') {
+    return run(captureControl);
   };
 })();
 
@@ -5755,7 +6891,11 @@ async function runSelectedMode() {
       return await runDomMode();
     }
 
-    return await runEmbeddedNetworkMode();
+    if (mode === 'automatic') {
+      return await runEmbeddedNetworkMode('automatic');
+    }
+
+    return await runEmbeddedNetworkMode('manual');
   } finally {
     process.argv = originalArgv;
   }
