@@ -194,14 +194,19 @@ The extract workflow CLI options are:
 The no-arguments interactive launcher covers the common settings from the same
 CLI contract:
 
-- workflow selection: `extract` or `crawl`
-- extract mode: `automatic`, `network`, or `dom`
-- output format: `md`, `json`, or `both`
-- diagnostics: `--debug` on or off
-- browser preference: auto-detect, Chrome, or Edge
-- crawl settle wait: recommended `10000` ms, `30000` ms, or a custom value
-- advanced overrides: `--profile`, `--output-dir`, `--output`,
-  `--debug-port`, and for crawl `--start-url`, `--state-file`, and `--select`
+- `recommended settings` is the fast path. It asks you to choose an installed
+  browser, then starts `crawl` with the default settings and the pending queue.
+  Failed items are retried first, then newly discovered items, then any
+  remaining pending items.
+- `custom settings` keeps the previous full menu:
+  - workflow selection: `extract` or `crawl`
+  - extract mode: `automatic`, `network`, or `dom`
+  - output format: `md`, `json`, or `both`
+  - diagnostics: `--debug` on or off
+  - browser preference: auto-detect, Chrome, or Edge
+  - crawl settle wait: recommended `10000` ms, `30000` ms, or a custom value
+  - advanced overrides: `--profile`, `--output-dir`, `--output`,
+    `--debug-port`, and for crawl `--start-url`, `--state-file`, and `--select`
 
 The crawl workflow CLI options are:
 
@@ -211,7 +216,7 @@ The crawl workflow CLI options are:
 | `--profile <query>` | Match a profile by name, email, or directory name. |
 | `--start-url <url>` | Override the Stream home URL used before the crawler switches to **Meetings**. |
 | `--state-file <path>` | Override the persistent crawl queue state file. |
-| `--select <spec>` | Select queue items non-interactively with `pending`, `new`, `failed`, `done`, `all`, or numeric ranges. |
+| `--select <spec>` | Select queue items non-interactively with `pending`, `new`, `failed`, `done`, `all`, or numeric ranges. `pending` retries failed items first, then new items, then any remaining pending items. If you omit it and a saved `*.state.json` or `*.batch.json` queue already exists, reruns automatically resume the actionable queue. |
 | `--wait-before-discovery-ms <ms>` | Delay discovery after the Stream URL opens so auth and page load can settle. Recommended and default: `10000` ms (`10` seconds). |
 | `--output <name>` | Override the batch status filename prefix. |
 | `--output-dir <path>` | Write transcript and batch status files to a custom directory. |
@@ -265,10 +270,17 @@ The crawl workflow also writes two queue artifacts:
 
 - `*.state.json` is the persistent crawl queue. It records discovered meeting
   URLs, progress state, and the latest extraction outcome per item so the next
-  run can merge in new discoveries without losing prior progress.
+  run can merge in new discoveries without losing prior progress. By default
+  the crawler keeps this at a stable path such as `output/crawl.state.json`.
 - `*.batch.json` is the current run summary. It records the current discovery
-  result, the terminal selection, and the success or failure state for each
-  extracted item.
+  result, the applied selection, the success or failure state for each
+  extracted item, and a snapshot of the saved queue so reruns can recover even
+  if the state file is missing. By default this stays at a stable path such as
+  `output/crawl.batch.json`.
+
+If you already have older timestamped queue files such as
+`output/crawl_2026-04-01T22-37-29.state.json`, the crawler imports them on the
+next run and migrates the queue forward to the stable default paths.
 
 Mode-specific output behavior:
 
@@ -508,8 +520,9 @@ extractor itself is wrong.
   already open and populated before extraction begins.
 - If the crawl workflow finds zero meetings, confirm that the selected profile
   can open the Stream **Meetings** view and that the page has finished
-  loading before discovery starts. If a `*.state.json` file already exists,
-  the workflow can still operate on the saved queue.
+  loading before discovery starts. If a `*.state.json` or `*.batch.json` file
+  already exists, rerun the crawl workflow to resume the saved queue and merge
+  in any newly discovered meetings.
 - If one crawl item fails but the rest succeed, inspect the saved
   `*.state.json` file first, then the matching `*.batch.json` file. They
   record the item URL, the latest queue status, any saved `*.network.json`

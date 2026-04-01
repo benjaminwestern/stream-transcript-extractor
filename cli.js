@@ -3,6 +3,7 @@
 import { spawnSync } from 'node:child_process';
 import { dirname } from 'node:path';
 import { printHelpScreen } from './lib/cli.js';
+import { discoverBrowsers } from './lib/browser-session.js';
 import {
   APP_DESCRIPTION,
   APP_NAME,
@@ -125,7 +126,7 @@ function printEntrypointHelp() {
           {
             label: 'bun ./cli.js',
             description:
-              'Open the interactive launcher in a real terminal. It lets you choose extract or crawl, then applies the same workflow settings for source and compiled builds.',
+              'Open the interactive launcher in a real terminal. The recommended path starts crawl with default settings and only asks you to choose a browser. The custom path keeps the full workflow menu.',
           },
           {
             label: './stream-transcript-extractor-<target>',
@@ -135,7 +136,7 @@ function printEntrypointHelp() {
           {
             label: 'bun ./cli.js crawl',
             description:
-              'Open Stream home, switch to Meetings, scroll the rendered list, merge the results into a persistent queue, then run automatic extraction against the items you select in the same browser session.',
+              'Open Stream home, switch to Meetings, scroll the rendered list, merge the results into a persistent queue, then run automatic extraction against the actionable queue in the same browser session.',
           },
         ],
       },
@@ -145,7 +146,7 @@ function printEntrypointHelp() {
           {
             label: 'crawl',
             description:
-              'Batch flow. Opens Stream home, selects Meetings, scrolls the visible page, merges results into a *.state.json queue, then wraps automatic extraction across the items you select.',
+              'Batch flow. Opens Stream home, selects Meetings, scrolls the visible page, merges results into a *.state.json queue, then wraps automatic extraction across new and failed items by default when resuming.',
           },
           {
             label: 'extract (default)',
@@ -198,6 +199,7 @@ function printEntrypointHelp() {
           `extract supports --mode <${SUPPORTED_EXTRACTOR_MODES.join('|')}>. Recommended and default: ${DEFAULT_EXTRACTOR_MODE}.`,
           `crawl supports --start-url <url>. Default: ${DEFAULT_CRAWL_START_URL}. It always wraps the automatic extractor in one browser session.`,
           `Both workflows default to --format ${DEFAULT_TRANSCRIPT_OUTPUT_FORMAT}.`,
+          'The interactive recommended path launches crawl with the pending queue. Failed items are retried first, then newly discovered items, then any remaining pending items.',
           'Run `bun ./cli.js --mode automatic --help` or `bun ./cli.js crawl --help` for workflow-specific help.',
         ],
       },
@@ -331,296 +333,370 @@ async function askOptionalValue(prompt, question) {
   return String(await prompt.ask(question)).trim();
 }
 
+function getDetectedBrowserChoices() {
+  const browsers = discoverBrowsers();
+
+  if (browsers.length === 0) {
+    throw new CliError('No supported Chrome or Edge profiles were found on this machine.');
+  }
+
+  return browsers.map((browser) => ({
+    value: browser.key,
+    label: browser.name,
+    description:
+      browser.profiles.length === 1
+        ? '1 local profile detected.'
+        : `${browser.profiles.length} local profiles detected.`,
+  }));
+}
+
+async function promptForRecommendedLaunchArgs(prompt) {
+  console.log('\nRecommended settings');
+  console.log(
+    'Run the crawl workflow with the default settings and automatically process the actionable queue.',
+  );
+
+  const browserChoices = getDetectedBrowserChoices();
+  let browserKey = browserChoices[0]?.value || '';
+
+  if (browserChoices.length === 1) {
+    console.log(`Using ${browserChoices[0].label}.`);
+  } else {
+    const browserChoice = await chooseInteractiveMenuChoice(
+      prompt,
+      'Browser',
+      '\nChoose a browser (number): ',
+      browserChoices,
+    );
+    browserKey = browserChoice.value;
+  }
+
+  return ['crawl', '--browser', browserKey, '--select', 'pending'];
+}
+
+async function promptForCustomLaunchArgs(prompt) {
+  console.log('\nCustom settings');
+  console.log(
+    'Choose a workflow and the common settings here. Advanced overrides still stay available as normal CLI flags.',
+  );
+
+  const workflowChoice = await chooseInteractiveMenuChoice(
+    prompt,
+    'Workflow',
+    '\nChoose a workflow (number): ',
+    [
+      {
+        value: 'crawl',
+        label: 'crawl',
+        description:
+          'Open Stream home, wait 10 seconds, switch to Meetings, scroll the page, build or update the queue, then extract selected items in the same browser session.',
+      },
+      {
+        value: 'extract',
+        label: 'extract',
+        description:
+          'Open one recording and run the single-meeting extractor. Recommended when you only need one transcript.',
+      },
+    ],
+  );
+
+  const args = [];
+  if (workflowChoice.value === 'crawl') {
+    args.push('crawl');
+  } else {
+    const modeChoice = await chooseInteractiveMenuChoice(
+      prompt,
+      'Extract mode',
+      '\nChoose an extract mode (number): ',
+      [
+        {
+          value: 'automatic',
+          label: 'automatic (Recommended)',
+          description:
+            'Lowest operator effort. Reloads with capture armed and tries the Transcript panel for you.',
+        },
+        {
+          value: 'network',
+          label: 'network',
+          description:
+            'Advanced path. You manage transcript-panel timing yourself and capture the network payload directly.',
+        },
+        {
+          value: 'dom',
+          label: 'dom',
+          description:
+            'Fallback path. Reads the visible transcript UI instead of relying on the transport layer.',
+        },
+      ],
+    );
+    args.push('--mode', modeChoice.value);
+  }
+
+  const formatChoice = await chooseInteractiveMenuChoice(
+    prompt,
+    'Transcript format',
+    '\nChoose an output format (number): ',
+    [
+      {
+        value: 'md',
+        label: 'md (Recommended)',
+        description:
+          'Best for review, sharing, and follow-up editing.',
+      },
+      {
+        value: 'json',
+        label: 'json',
+        description:
+          'Structured output for automation or downstream processing.',
+      },
+      {
+        value: 'both',
+        label: 'both',
+        description:
+          'Write both Markdown and JSON for the same run.',
+      },
+    ],
+  );
+  args.push('--format', formatChoice.value);
+
+  const debugChoice = await chooseInteractiveMenuChoice(
+    prompt,
+    'Diagnostics',
+    '\nChoose a diagnostics level (number): ',
+    [
+      {
+        value: 'off',
+        label: 'debug off (Recommended)',
+        description:
+          'Normal operator path. Keep output and terminal noise minimal.',
+      },
+      {
+        value: 'on',
+        label: 'debug on',
+        description:
+          'Write deeper diagnostics and print the automatic action trace when supported.',
+      },
+    ],
+  );
+  if (debugChoice.value === 'on') {
+    args.push('--debug');
+  }
+
+  const browserChoice = await chooseInteractiveMenuChoice(
+    prompt,
+    'Browser',
+    '\nChoose a browser preference (number): ',
+    [
+      {
+        value: '',
+        label: 'auto detect (Recommended)',
+        description:
+          'Choose later from available local browsers if needed.',
+      },
+      {
+        value: 'edge',
+        label: 'edge',
+        description:
+          'Prefer Microsoft Edge.',
+      },
+      {
+        value: 'chrome',
+        label: 'chrome',
+        description:
+          'Prefer Google Chrome.',
+      },
+    ],
+  );
+  if (browserChoice.value) {
+    args.push('--browser', browserChoice.value);
+  }
+
+  if (workflowChoice.value === 'crawl') {
+    const waitChoice = await chooseInteractiveMenuChoice(
+      prompt,
+      'Crawl settle wait',
+      '\nChoose the wait before discovery starts (number): ',
+      [
+        {
+          value: '10000',
+          label: '10 seconds (Recommended)',
+          description:
+            'Best default for normal auth and page load settle time.',
+        },
+        {
+          value: '30000',
+          label: '30 seconds',
+          description:
+            'Use when Stream auth or page hydration is unusually slow.',
+        },
+        {
+          value: 'custom',
+          label: 'custom',
+          description:
+            'Enter your own wait duration in milliseconds.',
+        },
+      ],
+    );
+
+    let waitBeforeDiscoveryMs = waitChoice.value;
+    if (waitChoice.value === 'custom') {
+      while (true) {
+        const customWait = await askOptionalValue(
+          prompt,
+          '\nEnter wait-before-discovery in milliseconds: ',
+        );
+        const parsed = Number.parseInt(customWait, 10);
+        if (Number.isInteger(parsed) && parsed >= 0) {
+          waitBeforeDiscoveryMs = String(parsed);
+          break;
+        }
+        console.log('Enter a whole number greater than or equal to 0.');
+      }
+    }
+
+    args.push('--wait-before-discovery-ms', waitBeforeDiscoveryMs);
+  }
+
+  const keepOpenChoice = await chooseInteractiveMenuChoice(
+    prompt,
+    'Browser lifecycle',
+    '\nKeep the launched browser open after the run? (number): ',
+    [
+      {
+        value: 'no',
+        label: 'no (Recommended)',
+        description:
+          'Close the temporary browser session when the run completes.',
+      },
+      {
+        value: 'yes',
+        label: 'yes',
+        description:
+          'Preserve the launched browser for manual follow-up after the run.',
+      },
+    ],
+  );
+  if (keepOpenChoice.value === 'yes') {
+    args.push('--keep-browser-open');
+  }
+
+  const advancedChoice = await chooseInteractiveMenuChoice(
+    prompt,
+    'Advanced overrides',
+    '\nConfigure advanced optional values? (number): ',
+    [
+      {
+        value: 'no',
+        label: 'no (Recommended)',
+        description:
+          'Use the recommended launcher path and keep the remaining values at their defaults.',
+      },
+      {
+        value: 'yes',
+        label: 'yes',
+        description:
+          'Set optional paths and workflow-specific overrides before launch.',
+      },
+    ],
+  );
+
+  if (advancedChoice.value === 'yes') {
+    const outputDir = await askOptionalValue(
+      prompt,
+      '\nOutput directory (Enter = default "output"): ',
+    );
+    if (outputDir) {
+      args.push('--output-dir', outputDir);
+    }
+
+    const profileQuery = await askOptionalValue(
+      prompt,
+      '\nProfile match (Enter = choose later or auto-pick single profile): ',
+    );
+    if (profileQuery) {
+      args.push('--profile', profileQuery);
+    }
+
+    const outputName = await askOptionalValue(
+      prompt,
+      '\nOutput filename prefix (Enter = default naming): ',
+    );
+    if (outputName) {
+      args.push('--output', outputName);
+    }
+
+    const debugPort = await askOptionalValue(
+      prompt,
+      '\nDebug port (Enter = automatic): ',
+    );
+    if (debugPort) {
+      args.push('--debug-port', debugPort);
+    }
+
+    if (workflowChoice.value === 'crawl') {
+      const startUrl = await askOptionalValue(
+        prompt,
+        '\nStart URL (Enter = default Stream home): ',
+      );
+      if (startUrl) {
+        args.push('--start-url', startUrl);
+      }
+
+      const stateFile = await askOptionalValue(
+        prompt,
+        '\nState file path (Enter = generated/default path): ',
+      );
+      if (stateFile) {
+        args.push('--state-file', stateFile);
+      }
+
+      const selectionSpec = await askOptionalValue(
+        prompt,
+        '\nSelection spec (Enter = choose later in the queue menu): ',
+      );
+      if (selectionSpec) {
+        args.push('--select', selectionSpec);
+      }
+    }
+  }
+
+  return args;
+}
+
 async function promptForInteractiveLaunchArgs() {
   const prompt = createPrompt();
 
   try {
     console.log('\nInteractive launch');
     console.log(
-      'Choose a workflow and the common settings here. Advanced overrides still stay available as normal CLI flags.',
+      'Choose the fast recommended crawl path or open the full custom settings flow.',
     );
 
-    const workflowChoice = await chooseInteractiveMenuChoice(
+    const launchChoice = await chooseInteractiveMenuChoice(
       prompt,
-      'Workflow',
-      '\nChoose a workflow (number): ',
+      'Launch mode',
+      '\nChoose launch mode (number): ',
       [
         {
-          value: 'crawl',
-          label: 'crawl',
+          value: 'recommended',
+          label: 'recommended settings',
           description:
-            'Open Stream home, wait 10 seconds, switch to Meetings, scroll the page, build or update the queue, then extract selected items in the same browser session.',
+            'Run the crawl workflow with the default settings, automatically process the pending queue, and only ask you to choose the browser up front.',
         },
         {
-          value: 'extract',
-          label: 'extract',
+          value: 'custom',
+          label: 'custom settings',
           description:
-            'Open one recording and run the single-meeting extractor. Recommended when you only need one transcript.',
+            'Open the existing full launcher so you can choose workflow, formats, diagnostics, and overrides.',
         },
       ],
     );
 
-    const args = [];
-    if (workflowChoice.value === 'crawl') {
-      args.push('crawl');
-    } else {
-      const modeChoice = await chooseInteractiveMenuChoice(
-        prompt,
-        'Extract mode',
-        '\nChoose an extract mode (number): ',
-        [
-          {
-            value: 'automatic',
-            label: 'automatic (Recommended)',
-            description:
-              'Lowest operator effort. Reloads with capture armed and tries the Transcript panel for you.',
-          },
-          {
-            value: 'network',
-            label: 'network',
-            description:
-              'Advanced path. You manage transcript-panel timing yourself and capture the network payload directly.',
-          },
-          {
-            value: 'dom',
-            label: 'dom',
-            description:
-              'Fallback path. Reads the visible transcript UI instead of relying on the transport layer.',
-          },
-        ],
-      );
-      args.push('--mode', modeChoice.value);
+    if (launchChoice.value === 'recommended') {
+      return promptForRecommendedLaunchArgs(prompt);
     }
 
-    const formatChoice = await chooseInteractiveMenuChoice(
-      prompt,
-      'Transcript format',
-      '\nChoose an output format (number): ',
-      [
-        {
-          value: 'md',
-          label: 'md (Recommended)',
-          description:
-            'Best for review, sharing, and follow-up editing.',
-        },
-        {
-          value: 'json',
-          label: 'json',
-          description:
-            'Structured output for automation or downstream processing.',
-        },
-        {
-          value: 'both',
-          label: 'both',
-          description:
-            'Write both Markdown and JSON for the same run.',
-        },
-      ],
-    );
-    args.push('--format', formatChoice.value);
-
-    const debugChoice = await chooseInteractiveMenuChoice(
-      prompt,
-      'Diagnostics',
-      '\nChoose a diagnostics level (number): ',
-      [
-        {
-          value: 'off',
-          label: 'debug off (Recommended)',
-          description:
-            'Normal operator path. Keep output and terminal noise minimal.',
-        },
-        {
-          value: 'on',
-          label: 'debug on',
-          description:
-            'Write deeper diagnostics and print the automatic action trace when supported.',
-        },
-      ],
-    );
-    if (debugChoice.value === 'on') {
-      args.push('--debug');
-    }
-
-    const browserChoice = await chooseInteractiveMenuChoice(
-      prompt,
-      'Browser',
-      '\nChoose a browser preference (number): ',
-      [
-        {
-          value: '',
-          label: 'auto detect (Recommended)',
-          description:
-            'Choose later from available local browsers if needed.',
-        },
-        {
-          value: 'edge',
-          label: 'edge',
-          description:
-            'Prefer Microsoft Edge.',
-        },
-        {
-          value: 'chrome',
-          label: 'chrome',
-          description:
-            'Prefer Google Chrome.',
-        },
-      ],
-    );
-    if (browserChoice.value) {
-      args.push('--browser', browserChoice.value);
-    }
-
-    if (workflowChoice.value === 'crawl') {
-      const waitChoice = await chooseInteractiveMenuChoice(
-        prompt,
-        'Crawl settle wait',
-        '\nChoose the wait before discovery starts (number): ',
-        [
-          {
-            value: '10000',
-            label: '10 seconds (Recommended)',
-            description:
-              'Best default for normal auth and page load settle time.',
-          },
-          {
-            value: '30000',
-            label: '30 seconds',
-            description:
-              'Use when Stream auth or page hydration is unusually slow.',
-          },
-          {
-            value: 'custom',
-            label: 'custom',
-            description:
-              'Enter your own wait duration in milliseconds.',
-          },
-        ],
-      );
-
-      let waitBeforeDiscoveryMs = waitChoice.value;
-      if (waitChoice.value === 'custom') {
-        while (true) {
-          const customWait = await askOptionalValue(
-            prompt,
-            '\nEnter wait-before-discovery in milliseconds: ',
-          );
-          const parsed = Number.parseInt(customWait, 10);
-          if (Number.isInteger(parsed) && parsed >= 0) {
-            waitBeforeDiscoveryMs = String(parsed);
-            break;
-          }
-          console.log('Enter a whole number greater than or equal to 0.');
-        }
-      }
-
-      args.push('--wait-before-discovery-ms', waitBeforeDiscoveryMs);
-    }
-
-    const keepOpenChoice = await chooseInteractiveMenuChoice(
-      prompt,
-      'Browser lifecycle',
-      '\nKeep the launched browser open after the run? (number): ',
-      [
-        {
-          value: 'no',
-          label: 'no (Recommended)',
-          description:
-            'Close the temporary browser session when the run completes.',
-        },
-        {
-          value: 'yes',
-          label: 'yes',
-          description:
-            'Preserve the launched browser for manual follow-up after the run.',
-        },
-      ],
-    );
-    if (keepOpenChoice.value === 'yes') {
-      args.push('--keep-browser-open');
-    }
-
-    const advancedChoice = await chooseInteractiveMenuChoice(
-      prompt,
-      'Advanced overrides',
-      '\nConfigure advanced optional values? (number): ',
-      [
-        {
-          value: 'no',
-          label: 'no (Recommended)',
-          description:
-            'Use the recommended launcher path and keep the remaining values at their defaults.',
-        },
-        {
-          value: 'yes',
-          label: 'yes',
-          description:
-            'Set optional paths and workflow-specific overrides before launch.',
-        },
-      ],
-    );
-
-    if (advancedChoice.value === 'yes') {
-      const outputDir = await askOptionalValue(
-        prompt,
-        '\nOutput directory (Enter = default "output"): ',
-      );
-      if (outputDir) {
-        args.push('--output-dir', outputDir);
-      }
-
-      const profileQuery = await askOptionalValue(
-        prompt,
-        '\nProfile match (Enter = choose later or auto-pick single profile): ',
-      );
-      if (profileQuery) {
-        args.push('--profile', profileQuery);
-      }
-
-      const outputName = await askOptionalValue(
-        prompt,
-        '\nOutput filename prefix (Enter = default naming): ',
-      );
-      if (outputName) {
-        args.push('--output', outputName);
-      }
-
-      const debugPort = await askOptionalValue(
-        prompt,
-        '\nDebug port (Enter = automatic): ',
-      );
-      if (debugPort) {
-        args.push('--debug-port', debugPort);
-      }
-
-      if (workflowChoice.value === 'crawl') {
-        const startUrl = await askOptionalValue(
-          prompt,
-          '\nStart URL (Enter = default Stream home): ',
-        );
-        if (startUrl) {
-          args.push('--start-url', startUrl);
-        }
-
-        const stateFile = await askOptionalValue(
-          prompt,
-          '\nState file path (Enter = generated/default path): ',
-        );
-        if (stateFile) {
-          args.push('--state-file', stateFile);
-        }
-
-        const selectionSpec = await askOptionalValue(
-          prompt,
-          '\nSelection spec (Enter = choose later in the queue menu): ',
-        );
-        if (selectionSpec) {
-          args.push('--select', selectionSpec);
-        }
-      }
-    }
-
-    return args;
+    return promptForCustomLaunchArgs(prompt);
   } finally {
     prompt.close();
   }
