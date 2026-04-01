@@ -15,19 +15,46 @@ import {
 } from 'node:fs';
 import { createServer } from 'node:net';
 import { homedir, platform, tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { createInterface } from 'node:readline';
+import { dirname, join, resolve } from 'node:path';
+import {
+  connectCdp as connectCoreCdp,
+  createCdpEventScope,
+  evaluate as evaluateWithCdp,
+  findPageTargets as findCorePageTargets,
+  getBrowserDebuggerWebSocketUrl as getCoreBrowserDebuggerWebSocketUrl,
+  navigatePageAndWait as navigateWithCdp,
+  reloadPageAndWait as reloadWithCdp,
+  waitForBrowserDebugEndpoint as waitForCoreBrowserDebugEndpoint,
+  waitForBrowserDebugEndpointToClose as waitForCoreBrowserDebugEndpointToClose,
+  waitForBrowserPageTarget as waitForCoreBrowserPageTarget,
+} from './lib/cdp.js';
+import {
+  chooseFromList as chooseCliFromList,
+  chooseManyFromList as chooseCliManyFromList,
+  createPrompt as createCliPrompt,
+  parseCliArgs as parseSharedCliArgs,
+  parseSelectionSpec as parseCliSelectionSpec,
+  printHelpScreen,
+} from './lib/cli.js';
+import {
+  createResponseBodyRecord,
+  loadResponseBody as loadCapturedResponseBody,
+} from './lib/network-capture.js';
 
 const APP_NAME = 'Stream Transcript Extractor';
 const APP_DESCRIPTION =
   'Extract Microsoft Teams recording transcripts from Microsoft Stream ' +
   'using your signed-in Chrome or Edge profile.';
-const DEFAULT_EXTRACTOR_MODE = 'network';
+const DEFAULT_WORKFLOW = 'extract';
+const SUPPORTED_WORKFLOWS = ['extract', 'crawl'];
+const DEFAULT_EXTRACTOR_MODE = 'automatic';
 const SUPPORTED_EXTRACTOR_MODES = ['network', 'automatic', 'dom'];
 const SUPPORTED_BROWSER_KEYS = ['chrome', 'edge'];
 const SUPPORTED_OUTPUT_FORMATS = ['json', 'md', 'both'];
-const DEFAULT_OUTPUT_FORMAT = 'md';
+const DEFAULT_TRANSCRIPT_OUTPUT_FORMAT = 'md';
 const DEFAULT_OUTPUT_DIR = 'output';
+const DEFAULT_CRAWL_START_URL =
+  'https://m365.cloud.microsoft/launch/Stream/?auth=2&home=1';
 const DEFAULT_CDP_HOST = '127.0.0.1';
 const DEFAULT_BROWSER_READY_TIMEOUT_MS = 15_000;
 const DEFAULT_CDP_TIMEOUT_MS = 30_000;
@@ -50,10 +77,11 @@ const BUILD_TIME =
 /**
  * Public source layout
  *
- * This repository intentionally keeps the extractor in one shareable source
- * file. The module is split into three logical sections:
+ * This repository keeps the Stream-specific runtime centered in one shareable
+ * source file while the reusable CLI and CDP helpers live in `lib/`.
+ * The module is split into three logical sections:
  * 1. The shared CLI entrypoint and DOM fallback implementation
- * 2. The embedded network extractor, kept self-contained in a closure
+ * 2. The embedded Stream network extractor, kept self-contained in a closure
  * 3. The final mode dispatcher that routes `--mode` before mode-specific
  *    argument parsing runs
  */
@@ -120,49 +148,6 @@ function sleep(ms) {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 }
 
-function normalizeExtractorMode(value) {
-  return String(value || '').trim().toLowerCase();
-}
-
-/**
- * Strip the top-level `--mode` flag before handing control to the selected
- * extractor. Each mode keeps its own argument parser so the shared entrypoint
- * stays thin and easy to reason about.
- */
-function resolveExtractorMode(argv) {
-  let mode = DEFAULT_EXTRACTOR_MODE;
-  const forwardedArgs = [];
-
-  for (let index = 0; index < argv.length; index += 1) {
-    const arg = argv[index];
-    const [flag, inlineValue] = arg.split(/=(.*)/s, 2);
-
-    if (flag !== '--mode') {
-      forwardedArgs.push(arg);
-      continue;
-    }
-
-    const value = readOptionValue(flag, inlineValue, argv[index + 1]);
-    mode = normalizeExtractorMode(value);
-
-    if (!SUPPORTED_EXTRACTOR_MODES.includes(mode)) {
-      throw new CliError(
-        `Unsupported mode "${value}". Use one of: ` +
-          `${SUPPORTED_EXTRACTOR_MODES.join(', ')}.`,
-      );
-    }
-
-    if (inlineValue == null) {
-      index += 1;
-    }
-  }
-
-  return {
-    mode,
-    forwardedArgs,
-  };
-}
-
 function readOptionValue(flag, inlineValue, nextArg) {
   const value = inlineValue ?? nextArg;
 
@@ -177,73 +162,63 @@ function readOptionValue(flag, inlineValue, nextArg) {
   return value;
 }
 
+function normalizeExtractorMode(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function normalizeWorkflow(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
 /**
- * @param {string[]} argv
- * @returns {CliOptions}
+ * Resolve the top-level workflow before handing control to the selected
+ * runtime. `extract` remains the default workflow, while `crawl` wraps the
+ * automatic extractor flow in the batch discovery worker.
  */
-function parseDomModeArgs(argv) {
-  /** @type {CliOptions} */
-  const options = {
-    browser: '',
-    profile: '',
-    outputName: '',
-    outputDir: DEFAULT_OUTPUT_DIR,
-    outputFormat: DEFAULT_OUTPUT_FORMAT,
-    debugPort: null,
-    debug: false,
-    keepBrowserOpen: false,
-    help: false,
-    version: false,
-  };
+function resolveWorkflowSelection(argv) {
+  let workflow = DEFAULT_WORKFLOW;
+  let workflowProvided = false;
+  let mode = DEFAULT_EXTRACTOR_MODE;
+  let modeProvided = false;
+  const forwardedArgs = [];
+  let startIndex = 0;
 
-  for (let index = 0; index < argv.length; index += 1) {
+  if (argv.length > 0 && !String(argv[0]).startsWith('-')) {
+    const candidate = normalizeWorkflow(argv[0]);
+    if (!SUPPORTED_WORKFLOWS.includes(candidate)) {
+      throw new CliError(
+        `Unsupported workflow "${argv[0]}". Use one of: ` +
+          `${SUPPORTED_WORKFLOWS.join(', ')}.`,
+      );
+    }
+
+    workflow = candidate;
+    workflowProvided = true;
+    startIndex = 1;
+  }
+
+  for (let index = startIndex; index < argv.length; index += 1) {
     const arg = argv[index];
-
-    if (arg === '--help' || arg === '-h') {
-      options.help = true;
-      continue;
-    }
-
-    if (arg === '--version' || arg === '-v') {
-      options.version = true;
-      continue;
-    }
-
-    if (arg === '--keep-browser-open') {
-      options.keepBrowserOpen = true;
-      continue;
-    }
-
-    if (arg === '--debug') {
-      options.debug = true;
-      continue;
-    }
-
-    if (!arg.startsWith('--')) {
-      throw new CliError(`Unexpected positional argument "${arg}".`);
-    }
-
     const [flag, inlineValue] = arg.split(/=(.*)/s, 2);
-    const value = readOptionValue(flag, inlineValue, argv[index + 1]);
 
-    if (flag === '--browser') {
-      options.browser = normalizeBrowserKey(value);
-    } else if (flag === '--profile') {
-      options.profile = value;
-    } else if (flag === '--output') {
-      options.outputName = value;
-    } else if (flag === '--output-dir') {
-      options.outputDir = value;
-    } else if (flag === '--format') {
-      options.outputFormat = String(value).trim().toLowerCase();
-    } else if (flag === '--debug-port') {
-      const parsedPort = Number.parseInt(value, 10);
-      if (!Number.isInteger(parsedPort) || parsedPort < 1 || parsedPort > 65_535) {
-        throw new CliError(`Invalid port "${value}".`);
-      }
-      options.debugPort = parsedPort;
-    } else {
-      throw new CliError(`Unknown option "${flag}".`);
+    if (flag !== '--mode') {
+      forwardedArgs.push(arg);
+      continue;
+    }
+
+    if (workflow !== 'extract') {
+      throw new CliError('--mode is only supported for the extract workflow.');
+    }
+
+    const value = readOptionValue(flag, inlineValue, argv[index + 1]);
+    mode = normalizeExtractorMode(value);
+    modeProvided = true;
+
+    if (!SUPPORTED_EXTRACTOR_MODES.includes(mode)) {
+      throw new CliError(
+        `Unsupported mode "${value}". Use one of: ` +
+          `${SUPPORTED_EXTRACTOR_MODES.join(', ')}.`,
+      );
     }
 
     if (inlineValue == null) {
@@ -251,86 +226,145 @@ function parseDomModeArgs(argv) {
     }
   }
 
-  if (
-    options.browser &&
-    !SUPPORTED_BROWSER_KEYS.includes(options.browser)
-  ) {
-    throw new CliError(
-      `Unsupported browser "${options.browser}". Use one of: ` +
-        `${SUPPORTED_BROWSER_KEYS.join(', ')}.`,
-    );
-  }
+  return {
+    workflow,
+    workflowProvided,
+    mode,
+    modeProvided,
+    forwardedArgs,
+  };
+}
 
-  if (!SUPPORTED_OUTPUT_FORMATS.includes(options.outputFormat)) {
-    throw new CliError(
-      `Unsupported output format "${options.outputFormat}". Use one of: ` +
-        `${SUPPORTED_OUTPUT_FORMATS.join(', ')}.`,
-    );
-  }
-
-  return options;
+/**
+ * @param {string[]} argv
+ * @returns {CliOptions}
+ */
+function parseDomModeArgs(argv) {
+  return parseSharedCliArgs(argv, {
+    defaults: {
+      browser: '',
+      profile: '',
+      outputName: '',
+      outputDir: DEFAULT_OUTPUT_DIR,
+      outputFormat: DEFAULT_TRANSCRIPT_OUTPUT_FORMAT,
+      debugPort: null,
+      debug: false,
+      keepBrowserOpen: false,
+      help: false,
+      version: false,
+    },
+    supportedBrowserKeys: SUPPORTED_BROWSER_KEYS,
+    supportedOutputFormats: SUPPORTED_OUTPUT_FORMATS,
+    normalizeBrowserKey,
+    errorFactory: (message) => new CliError(message),
+  });
 }
 
 function printEntrypointHelp() {
-  console.log(`${APP_NAME}`);
-  console.log(`${APP_DESCRIPTION}\n`);
-  console.log('Usage:');
-  console.log('  bun extract.js [options]');
-  console.log('  ./<compiled-binary> [options]\n');
-  console.log('Guided setup:');
-  console.log(
-    '  Run with no flags in an interactive terminal to choose mode, browser, profile,',
-  );
-  console.log(
-    '  output settings, diagnostics, and browser shutdown behavior through menus.\n',
-  );
-  console.log('  Press Enter in guided menus to accept the recommended choice.\n');
-  console.log('Options:');
-  console.log(
-    `  --mode <network|automatic|dom>  Choose the extractor mode (default: ${DEFAULT_EXTRACTOR_MODE}).`,
-  );
-  console.log('  --browser <chrome|edge>  Use a specific browser instead of the menu.');
-  console.log('  --profile <query>        Match a profile by name, email, or directory.');
-  console.log('  --output <name>          Override the output filename prefix.');
-  console.log('  --output-dir <path>      Write output files to a custom directory.');
-  console.log(
-    `  --format <json|md|both>  Choose JSON, Markdown, or both outputs (default: ${DEFAULT_OUTPUT_FORMAT}).`,
-  );
-  console.log('  --debug-port <port>      Force a specific browser control port.');
-  console.log(
-    '  --debug                  Write extra diagnostics. In automatic mode this also',
-  );
-  console.log(
-    '                           prints each UI action, retry, and fallback reason.',
-  );
-  console.log('  --keep-browser-open      Leave the launched browser open after extraction.');
-  console.log('  --version, -v            Print the build version.');
-  console.log('  --help, -h               Show this help text.\n');
-  console.log('Mode flow:');
-  console.log(
-    '  network    Open the Stream page first with the Transcript panel closed.',
-  );
-  console.log(
-    '             After capture is armed, open the Transcript panel and let it load.',
-  );
-  console.log(
-    '  automatic Reload with capture armed, try to open the Transcript panel,',
-  );
-  console.log(
-    '             nudge/retry automatically, then keep capture armed if manual',
-  );
-  console.log(
-    '             help is still needed.',
-  );
-  console.log(
-    '  dom        Open the Stream page and Transcript panel before extraction starts.\n',
-  );
-  console.log('Examples:');
-  console.log('  bun extract.js                # opens guided setup');
-  console.log('  bun extract.js --mode network --debug');
-  console.log('  bun extract.js --mode automatic');
-  console.log('  bun extract.js --mode automatic --debug');
-  console.log('  bun extract.js --mode dom --format md');
+  printHelpScreen({
+    name: APP_NAME,
+    summary: APP_DESCRIPTION,
+    usage: [
+      'bun ./extract.js [options]',
+      'bun ./extract.js crawl [options]',
+      './stream-transcript-extractor-<target> [workflow] [options]',
+    ],
+    sections: [
+      {
+        title: 'Start here',
+        rows: [
+          {
+            label: 'bun ./extract.js',
+            description:
+              'Open the interactive launcher in a real terminal. It lets you choose extract or crawl, then applies the same workflow settings for source and compiled builds.',
+          },
+          {
+            label: './stream-transcript-extractor-<target>',
+            description:
+              'Open the same interactive launcher from a compiled binary in a real terminal.',
+          },
+          {
+            label: 'bun ./extract.js crawl',
+            description:
+              'Open Stream home, switch to Meetings, scroll the rendered list, merge the results into a persistent queue, then run automatic extraction against the items you select in the same browser session.',
+          },
+        ],
+      },
+      {
+        title: 'Workflows',
+        rows: [
+          {
+            label: 'crawl',
+            description:
+              'Batch flow. Opens Stream home, selects Meetings, scrolls the visible page, merges results into a *.state.json queue, then wraps automatic extraction across the items you select.',
+          },
+          {
+            label: 'extract (default)',
+            description:
+              'Single-meeting extraction. Supports --mode network, automatic, or dom.',
+          },
+        ],
+      },
+      {
+        title: 'Shared options',
+        rows: [
+          { label: '--browser <chrome|edge>', description: 'Use a specific browser.' },
+          {
+            label: '--profile <query>',
+            description: 'Match a profile by name, email, or directory.',
+          },
+          {
+            label: '--output <name>',
+            description: 'Override the transcript filename prefix.',
+          },
+          {
+            label: '--output-dir <path>',
+            description: 'Write output files to a custom directory.',
+          },
+          {
+            label: '--format <json|md|both>',
+            description:
+              'Transcript output format. Recommended and default: md. Use json for structured automation or both when you need both.',
+          },
+          {
+            label: '--debug-port <port>',
+            description: 'Force a specific remote-debugging port.',
+          },
+          {
+            label: '--debug',
+            description:
+              'Write extra diagnostics. Recommended default: leave this off for normal runs. Turn it on when you are diagnosing a failed or suspicious extraction.',
+          },
+          {
+            label: '--keep-browser-open',
+            description: 'Leave the launched browser open after extraction.',
+          },
+          { label: '--version, -v', description: 'Print the build version.' },
+          { label: '--help, -h', description: 'Show this help text.' },
+        ],
+      },
+      {
+        title: 'Workflow-specific options',
+        lines: [
+          `extract supports --mode <${SUPPORTED_EXTRACTOR_MODES.join('|')}>. Recommended and default: ${DEFAULT_EXTRACTOR_MODE}.`,
+          `crawl supports --start-url <url>. Default: ${DEFAULT_CRAWL_START_URL}. It always wraps the automatic extractor in one browser session.`,
+          `Both workflows default to --format ${DEFAULT_TRANSCRIPT_OUTPUT_FORMAT}.`,
+          'Run `bun ./extract.js --mode automatic --help` or `bun ./extract.js crawl --help` for workflow-specific help.',
+        ],
+      },
+      {
+        title: 'Examples',
+        lines: [
+          'bun ./extract.js',
+          'bun ./extract.js --browser chrome --profile Work',
+          'bun ./extract.js crawl',
+          'bun ./extract.js crawl --state-file ./exports/team.state.json',
+          'bun ./extract.js --mode network --output-dir ./exports --format both',
+          'bun ./extract.js --mode dom --debug',
+        ],
+      },
+    ],
+  });
 }
 
 function printEntrypointVersion() {
@@ -351,37 +385,7 @@ function ensureSupportedPlatform() {
 }
 
 function createPrompt() {
-  const readline = createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
-
-  return {
-    ask(question) {
-      return new Promise((resolveAnswer) =>
-        readline.question(question, resolveAnswer),
-      );
-    },
-    waitForEnter(message = 'Press Enter to continue...') {
-      return new Promise((resolveAnswer) =>
-        readline.question(message, () => resolveAnswer()),
-      );
-    },
-    close() {
-      readline.close();
-    },
-  };
-}
-
-/**
- * @param {string} title
- * @param {string[]} items
- */
-function printMenu(title, items) {
-  console.log(`\n${title}`);
-  items.forEach((item, index) => {
-    console.log(`  ${index + 1}. ${item}`);
-  });
+  return createCliPrompt();
 }
 
 /**
@@ -391,392 +395,331 @@ function printMenu(title, items) {
  * @param {T[]} items
  * @param {(item: T) => string} renderItem
  * @param {string} question
- * @param {number | null} [defaultIndex]
  * @returns {Promise<T>}
  */
-async function chooseFromList(
-  prompt,
-  title,
-  items,
-  renderItem,
-  question,
-  defaultIndex = null,
-) {
-  printMenu(title, items.map(renderItem));
-
-  while (true) {
-    const answer = (await prompt.ask(question)).trim();
-    if (answer === '' && defaultIndex != null && items[defaultIndex]) {
-      return items[defaultIndex];
-    }
-    const selectedIndex = Number.parseInt(answer, 10) - 1;
-    const selectedItem = items[selectedIndex];
-
-    if (selectedItem) {
-      return selectedItem;
-    }
-
-    console.log('Enter one of the listed numbers.');
-  }
+async function chooseFromList(prompt, title, items, renderItem, question) {
+  return chooseCliFromList(prompt, title, items, renderItem, question);
 }
 
-function shouldUseGuidedSetup(argv) {
+function isInteractiveEntrypointLaunch(argv) {
   return (
+    Array.isArray(argv) &&
     argv.length === 0 &&
     Boolean(process.stdin.isTTY) &&
     Boolean(process.stdout.isTTY)
   );
 }
 
-function buildForwardedArgsFromOptions(options) {
-  const forwardedArgs = [];
-
-  if (options.browser) {
-    forwardedArgs.push('--browser', options.browser);
-  }
-
-  if (options.profile) {
-    forwardedArgs.push('--profile', options.profile);
-  }
-
-  if (options.outputName) {
-    forwardedArgs.push('--output', options.outputName);
-  }
-
-  if (options.outputDir && options.outputDir !== DEFAULT_OUTPUT_DIR) {
-    forwardedArgs.push('--output-dir', options.outputDir);
-  }
-
-  if (options.outputFormat && options.outputFormat !== DEFAULT_OUTPUT_FORMAT) {
-    forwardedArgs.push('--format', options.outputFormat);
-  }
-
-  if (options.debugPort != null) {
-    forwardedArgs.push('--debug-port', String(options.debugPort));
-  }
-
-  if (options.debug) {
-    forwardedArgs.push('--debug');
-  }
-
-  if (options.keepBrowserOpen) {
-    forwardedArgs.push('--keep-browser-open');
-  }
-
-  return forwardedArgs;
+function renderInteractiveMenuChoice(choice) {
+  const label = String(choice?.label || '').trim();
+  const description = String(choice?.description || '').trim();
+  return description ? `${label} | ${description}` : label;
 }
 
-function formatSettingValue(value, fallback) {
-  return value ? value : fallback;
-}
-
-async function chooseModeInteractively(prompt) {
-  const modes = [
-    {
-      value: 'network',
-      label: 'Network (recommended)',
-      description: 'Capture the transcript payload directly with the most reliable flow.',
-    },
-    {
-      value: 'automatic',
-      label: 'Automatic',
-      description: 'Use network capture, reload once, and try the Transcript panel for me.',
-    },
-    {
-      value: 'dom',
-      label: 'DOM',
-      description: 'Scroll the rendered transcript UI when transport capture is unsuitable.',
-    },
-  ];
-
-  const selectedMode = await chooseFromList(
+async function chooseInteractiveMenuChoice(prompt, title, question, choices) {
+  return chooseFromList(
     prompt,
-    'Capture mode',
-    modes,
-    (mode) => `${mode.label} - ${mode.description}`,
-    '\nSelect mode (number, Enter for recommended): ',
-    0,
-  );
-
-  return selectedMode.value;
-}
-
-async function chooseGuidedSetupPath(prompt) {
-  const setupPaths = [
-    {
-      value: 'recommended',
-      label: 'Recommended settings',
-      description: 'Use the default output, automatic debug port, and no extra diagnostics.',
-    },
-    {
-      value: 'custom',
-      label: 'Review all settings',
-      description: 'Choose output, diagnostics, remote debug port, and browser shutdown behavior.',
-    },
-  ];
-
-  const selectedPath = await chooseFromList(
-    prompt,
-    'Run setup',
-    setupPaths,
-    (item) => `${item.label} - ${item.description}`,
-    '\nSelect setup path (number, Enter for recommended): ',
-    0,
-  );
-
-  return selectedPath.value;
-}
-
-async function chooseOutputFormatInteractively(prompt) {
-  const formats = [
-    {
-      value: 'md',
-      label: 'Markdown only (recommended)',
-      description: 'Write one review-friendly transcript file.',
-    },
-    {
-      value: 'json',
-      label: 'JSON only',
-      description: 'Write one machine-friendly transcript file.',
-    },
-    {
-      value: 'both',
-      label: 'JSON and Markdown',
-      description: 'Write both transcript formats for the same run.',
-    },
-  ];
-
-  const selectedFormat = await chooseFromList(
-    prompt,
-    'Output format',
-    formats,
-    (format) => `${format.label} - ${format.description}`,
-    '\nSelect output format (number, Enter for recommended): ',
-    0,
-  );
-
-  return selectedFormat.value;
-}
-
-async function chooseOutputNameInteractively(prompt) {
-  const namingOptions = [
-    {
-      value: 'automatic',
-      label: 'Automatic name (recommended)',
-      description: 'Build the filename prefix from the meeting metadata.',
-    },
-    {
-      value: 'custom',
-      label: 'Custom name',
-      description: 'Enter the filename prefix yourself.',
-    },
-  ];
-
-  const selectedNaming = await chooseFromList(
-    prompt,
-    'Output filename prefix',
-    namingOptions,
-    (option) => `${option.label} - ${option.description}`,
-    '\nSelect naming option (number, Enter for recommended): ',
-    0,
-  );
-
-  if (selectedNaming.value !== 'custom') {
-    return '';
-  }
-
-  return (await prompt.ask(
-    '\nEnter the output filename prefix, or press Enter to keep automatic naming: ',
-  )).trim();
-}
-
-async function chooseOutputDirectoryInteractively(prompt) {
-  const outputDirectories = [
-    {
-      value: 'default',
-      label: `Default directory (${DEFAULT_OUTPUT_DIR})`,
-      description: 'Write transcript files to the standard output folder.',
-    },
-    {
-      value: 'custom',
-      label: 'Custom directory',
-      description: 'Choose a different output folder for this run.',
-    },
-  ];
-
-  const selectedDirectory = await chooseFromList(
-    prompt,
-    'Output directory',
-    outputDirectories,
-    (option) => `${option.label} - ${option.description}`,
-    '\nSelect output directory option (number, Enter for recommended): ',
-    0,
-  );
-
-  if (selectedDirectory.value !== 'custom') {
-    return DEFAULT_OUTPUT_DIR;
-  }
-
-  const customOutputDir = (await prompt.ask(
-    `\nEnter the output directory, or press Enter to keep ${DEFAULT_OUTPUT_DIR}: `,
-  )).trim();
-
-  return customOutputDir || DEFAULT_OUTPUT_DIR;
-}
-
-async function chooseDebugSettingInteractively(prompt) {
-  const debugChoices = [
-    {
-      value: false,
-      label: 'Debug off (recommended)',
-      description: 'Skip extra diagnostics and keep the terminal output focused.',
-    },
-    {
-      value: true,
-      label: 'Debug on',
-      description: 'Save deeper diagnostics and print more mode-specific detail.',
-    },
-  ];
-
-  const selectedDebugChoice = await chooseFromList(
-    prompt,
-    'Diagnostics',
-    debugChoices,
-    (choice) => `${choice.label} - ${choice.description}`,
-    '\nSelect diagnostics setting (number, Enter for recommended): ',
-    0,
-  );
-
-  return selectedDebugChoice.value;
-}
-
-async function chooseDebugPortInteractively(prompt) {
-  const portChoices = [
-    {
-      value: 'automatic',
-      label: 'Automatic port (recommended)',
-      description: 'Let the extractor choose an open browser control port.',
-    },
-    {
-      value: 'custom',
-      label: 'Custom port',
-      description: 'Choose the exact browser control port yourself.',
-    },
-  ];
-
-  const selectedPortChoice = await chooseFromList(
-    prompt,
-    'Browser control port',
-    portChoices,
-    (choice) => `${choice.label} - ${choice.description}`,
-    '\nSelect port setting (number, Enter for recommended): ',
-    0,
-  );
-
-  if (selectedPortChoice.value !== 'custom') {
-    return null;
-  }
-
-  while (true) {
-    const answer = (await prompt.ask(
-      '\nEnter the browser control port, or press Enter to keep automatic port selection: ',
-    )).trim();
-
-    if (!answer) {
-      return null;
-    }
-
-    const parsedPort = Number.parseInt(answer, 10);
-    if (Number.isInteger(parsedPort) && parsedPort >= 1 && parsedPort <= 65_535) {
-      return parsedPort;
-    }
-
-    console.log('Enter a valid port between 1 and 65535.');
-  }
-}
-
-async function chooseKeepBrowserOpenInteractively(prompt) {
-  const keepBrowserOpenChoices = [
-    {
-      value: false,
-      label: 'Close the browser when finished (recommended)',
-      description: 'Shut down the temporary browser window after extraction.',
-    },
-    {
-      value: true,
-      label: 'Keep the browser open',
-      description: 'Leave the launched browser window open after extraction.',
-    },
-  ];
-
-  const selectedChoice = await chooseFromList(
-    prompt,
-    'Browser shutdown behavior',
-    keepBrowserOpenChoices,
-    (choice) => `${choice.label} - ${choice.description}`,
-    '\nSelect browser shutdown behavior (number, Enter for recommended): ',
-    0,
-  );
-
-  return selectedChoice.value;
-}
-
-function printGuidedSetupSummary({ mode, browser, profile, options }) {
-  console.log('\nRun summary');
-  console.log(`  Mode: ${mode}`);
-  console.log(`  Browser: ${browser.name}`);
-  console.log(`  Profile: ${profile.displayName}`);
-  console.log(`  Output format: ${options.outputFormat}`);
-  console.log(
-    `  Output name: ${formatSettingValue(options.outputName, 'Automatic from meeting metadata')}`,
-  );
-  console.log(`  Output directory: ${options.outputDir}`);
-  console.log(`  Debug diagnostics: ${options.debug ? 'On' : 'Off'}`);
-  console.log(
-    `  Browser control port: ${options.debugPort == null ? 'Automatic' : options.debugPort}`,
-  );
-  console.log(
-    `  Keep browser open: ${options.keepBrowserOpen ? 'Yes' : 'No'}`,
+    title,
+    choices,
+    renderInteractiveMenuChoice,
+    question,
   );
 }
 
-async function runGuidedSetup() {
-  ensureSupportedPlatform();
+async function askOptionalValue(prompt, question) {
+  return String(await prompt.ask(question)).trim();
+}
 
+async function promptForInteractiveLaunchArgs() {
   const prompt = createPrompt();
-  const options = parseDomModeArgs([]);
 
   try {
-    console.log('\nGuided setup');
+    console.log('\nInteractive launch');
     console.log(
-      'Choose a mode first, then keep the recommended defaults or review the full run settings.',
+      'Choose a workflow and the common settings here. Advanced overrides still stay available as normal CLI flags.',
     );
-    console.log('Press Enter in the guided menus to accept the recommended choice.');
 
-    const mode = await chooseModeInteractively(prompt);
-    const { browser, profile } = await selectBrowserAndProfile(options, prompt);
-    options.browser = browser.key;
-    options.profile = profile.dirName;
+    const workflowChoice = await chooseInteractiveMenuChoice(
+      prompt,
+      'Workflow',
+      '\nChoose a workflow (number): ',
+      [
+        {
+          value: 'crawl',
+          label: 'crawl',
+          description:
+            'Open Stream home, wait 10 seconds, switch to Meetings, scroll the page, build or update the queue, then extract selected items in the same browser session.',
+        },
+        {
+          value: 'extract',
+          label: 'extract',
+          description:
+            'Open one recording and run the single-meeting extractor. Recommended when you only need one transcript.',
+        },
+      ],
+    );
 
-    const setupPath = await chooseGuidedSetupPath(prompt);
-    if (setupPath === 'custom') {
-      options.outputFormat = await chooseOutputFormatInteractively(prompt);
-      options.outputName = await chooseOutputNameInteractively(prompt);
-      options.outputDir = await chooseOutputDirectoryInteractively(prompt);
-      options.debug = await chooseDebugSettingInteractively(prompt);
-      options.debugPort = await chooseDebugPortInteractively(prompt);
-      options.keepBrowserOpen = await chooseKeepBrowserOpenInteractively(prompt);
+    const args = [];
+    if (workflowChoice.value === 'crawl') {
+      args.push('crawl');
+    } else {
+      const modeChoice = await chooseInteractiveMenuChoice(
+        prompt,
+        'Extract mode',
+        '\nChoose an extract mode (number): ',
+        [
+          {
+            value: 'automatic',
+            label: 'automatic (Recommended)',
+            description:
+              'Lowest operator effort. Reloads with capture armed and tries the Transcript panel for you.',
+          },
+          {
+            value: 'network',
+            label: 'network',
+            description:
+              'Advanced path. You manage transcript-panel timing yourself and capture the network payload directly.',
+          },
+          {
+            value: 'dom',
+            label: 'dom',
+            description:
+              'Fallback path. Reads the visible transcript UI instead of relying on the transport layer.',
+          },
+        ],
+      );
+      args.push('--mode', modeChoice.value);
     }
 
-    printGuidedSetupSummary({ mode, browser, profile, options });
-    await prompt.waitForEnter(
-      '\nPress Enter to launch the extractor with these settings...\n',
+    const formatChoice = await chooseInteractiveMenuChoice(
+      prompt,
+      'Transcript format',
+      '\nChoose an output format (number): ',
+      [
+        {
+          value: 'md',
+          label: 'md (Recommended)',
+          description:
+            'Best for review, sharing, and follow-up editing.',
+        },
+        {
+          value: 'json',
+          label: 'json',
+          description:
+            'Structured output for automation or downstream processing.',
+        },
+        {
+          value: 'both',
+          label: 'both',
+          description:
+            'Write both Markdown and JSON for the same run.',
+        },
+      ],
+    );
+    args.push('--format', formatChoice.value);
+
+    const debugChoice = await chooseInteractiveMenuChoice(
+      prompt,
+      'Diagnostics',
+      '\nChoose a diagnostics level (number): ',
+      [
+        {
+          value: 'off',
+          label: 'debug off (Recommended)',
+          description:
+            'Normal operator path. Keep output and terminal noise minimal.',
+        },
+        {
+          value: 'on',
+          label: 'debug on',
+          description:
+            'Write deeper diagnostics and print the automatic action trace when supported.',
+        },
+      ],
+    );
+    if (debugChoice.value === 'on') {
+      args.push('--debug');
+    }
+
+    const browserChoice = await chooseInteractiveMenuChoice(
+      prompt,
+      'Browser',
+      '\nChoose a browser preference (number): ',
+      [
+        {
+          value: '',
+          label: 'auto detect (Recommended)',
+          description:
+            'Choose later from available local browsers if needed.',
+        },
+        {
+          value: 'edge',
+          label: 'edge',
+          description:
+            'Prefer Microsoft Edge.',
+        },
+        {
+          value: 'chrome',
+          label: 'chrome',
+          description:
+            'Prefer Google Chrome.',
+        },
+      ],
+    );
+    if (browserChoice.value) {
+      args.push('--browser', browserChoice.value);
+    }
+
+    if (workflowChoice.value === 'crawl') {
+      const waitChoice = await chooseInteractiveMenuChoice(
+        prompt,
+        'Crawl settle wait',
+        '\nChoose the wait before discovery starts (number): ',
+        [
+          {
+            value: '10000',
+            label: '10 seconds (Recommended)',
+            description:
+              'Best default for normal auth and page load settle time.',
+          },
+          {
+            value: '30000',
+            label: '30 seconds',
+            description:
+              'Use when Stream auth or page hydration is unusually slow.',
+          },
+          {
+            value: 'custom',
+            label: 'custom',
+            description:
+              'Enter your own wait duration in milliseconds.',
+          },
+        ],
+      );
+
+      let waitBeforeDiscoveryMs = waitChoice.value;
+      if (waitChoice.value === 'custom') {
+        while (true) {
+          const customWait = await askOptionalValue(
+            prompt,
+            '\nEnter wait-before-discovery in milliseconds: ',
+          );
+          const parsed = Number.parseInt(customWait, 10);
+          if (Number.isInteger(parsed) && parsed >= 0) {
+            waitBeforeDiscoveryMs = String(parsed);
+            break;
+          }
+          console.log('Enter a whole number greater than or equal to 0.');
+        }
+      }
+
+      args.push('--wait-before-discovery-ms', waitBeforeDiscoveryMs);
+    }
+
+    const keepOpenChoice = await chooseInteractiveMenuChoice(
+      prompt,
+      'Browser lifecycle',
+      '\nKeep the launched browser open after the run? (number): ',
+      [
+        {
+          value: 'no',
+          label: 'no (Recommended)',
+          description:
+            'Close the temporary browser session when the run completes.',
+        },
+        {
+          value: 'yes',
+          label: 'yes',
+          description:
+            'Preserve the launched browser for manual follow-up after the run.',
+        },
+      ],
+    );
+    if (keepOpenChoice.value === 'yes') {
+      args.push('--keep-browser-open');
+    }
+
+    const advancedChoice = await chooseInteractiveMenuChoice(
+      prompt,
+      'Advanced overrides',
+      '\nConfigure advanced optional values? (number): ',
+      [
+        {
+          value: 'no',
+          label: 'no (Recommended)',
+          description:
+            'Use the recommended launcher path and keep the remaining values at their defaults.',
+        },
+        {
+          value: 'yes',
+          label: 'yes',
+          description:
+            'Set optional paths and workflow-specific overrides before launch.',
+        },
+      ],
     );
 
-    return {
-      mode,
-      forwardedArgs: buildForwardedArgsFromOptions(options),
-    };
+    if (advancedChoice.value === 'yes') {
+      const outputDir = await askOptionalValue(
+        prompt,
+        '\nOutput directory (Enter = default "output"): ',
+      );
+      if (outputDir) {
+        args.push('--output-dir', outputDir);
+      }
+
+      const profileQuery = await askOptionalValue(
+        prompt,
+        '\nProfile match (Enter = choose later or auto-pick single profile): ',
+      );
+      if (profileQuery) {
+        args.push('--profile', profileQuery);
+      }
+
+      const outputName = await askOptionalValue(
+        prompt,
+        '\nOutput filename prefix (Enter = default naming): ',
+      );
+      if (outputName) {
+        args.push('--output', outputName);
+      }
+
+      const debugPort = await askOptionalValue(
+        prompt,
+        '\nDebug port (Enter = automatic): ',
+      );
+      if (debugPort) {
+        args.push('--debug-port', debugPort);
+      }
+
+      if (workflowChoice.value === 'crawl') {
+        const startUrl = await askOptionalValue(
+          prompt,
+          '\nStart URL (Enter = default Stream home): ',
+        );
+        if (startUrl) {
+          args.push('--start-url', startUrl);
+        }
+
+        const stateFile = await askOptionalValue(
+          prompt,
+          '\nState file path (Enter = generated/default path): ',
+        );
+        if (stateFile) {
+          args.push('--state-file', stateFile);
+        }
+
+        const selectionSpec = await askOptionalValue(
+          prompt,
+          '\nSelection spec (Enter = choose later in the queue menu): ',
+        );
+        if (selectionSpec) {
+          args.push('--select', selectionSpec);
+        }
+      }
+    }
+
+    return args;
   } finally {
     prompt.close();
   }
@@ -817,116 +760,19 @@ async function findAvailablePort(requestedPort) {
   });
 }
 
-/**
- * A small CDP client is enough here: we only need `Runtime.evaluate`.
- *
- * @param {string} websocketUrl
- */
 async function connectCdp(websocketUrl) {
-  const websocket = new WebSocket(websocketUrl);
-  const pendingRequests = new Map();
-  let nextMessageId = 0;
-
-  await new Promise((resolveConnection, rejectConnection) => {
-    const timeout = setTimeout(() => {
-      rejectConnection(new CliError('WebSocket connection timeout.'));
-    }, 10_000);
-
-    websocket.onopen = () => {
-      clearTimeout(timeout);
-      resolveConnection();
-    };
-
-    websocket.onerror = (event) => {
-      clearTimeout(timeout);
-      rejectConnection(
-        new CliError(
-          `WebSocket connection failed: ${event.message || 'unknown error'}.`,
-        ),
-      );
-    };
+  return connectCoreCdp(websocketUrl, {
+    defaultTimeoutMs: DEFAULT_CDP_TIMEOUT_MS,
+    errorFactory: (message) => new CliError(message),
   });
-
-  websocket.onmessage = (event) => {
-    const payload = JSON.parse(event.data);
-    if (!payload.id || !pendingRequests.has(payload.id)) {
-      return;
-    }
-
-    const { resolveRequest, rejectRequest, timeout } =
-      pendingRequests.get(payload.id);
-    clearTimeout(timeout);
-    pendingRequests.delete(payload.id);
-
-    if (payload.error) {
-      rejectRequest(
-        new CliError(`CDP request failed: ${payload.error.message}`),
-      );
-      return;
-    }
-
-    resolveRequest(payload.result);
-  };
-
-  websocket.onclose = () => {
-    for (const [requestId, request] of pendingRequests.entries()) {
-      clearTimeout(request.timeout);
-      request.rejectRequest(
-        new CliError(`CDP connection closed before request ${requestId} completed.`),
-      );
-      pendingRequests.delete(requestId);
-    }
-  };
-
-  return {
-    send(method, params = {}, timeoutMs = DEFAULT_CDP_TIMEOUT_MS) {
-      const messageId = nextMessageId + 1;
-      nextMessageId = messageId;
-
-      return new Promise((resolveRequest, rejectRequest) => {
-        const timeout = setTimeout(() => {
-          pendingRequests.delete(messageId);
-          rejectRequest(new CliError(`CDP ${method} timed out.`));
-        }, timeoutMs);
-
-        pendingRequests.set(messageId, {
-          resolveRequest,
-          rejectRequest,
-          timeout,
-        });
-
-        websocket.send(
-          JSON.stringify({
-            id: messageId,
-            method,
-            params,
-          }),
-        );
-      });
-    },
-    close() {
-      for (const request of pendingRequests.values()) {
-        clearTimeout(request.timeout);
-      }
-      pendingRequests.clear();
-      websocket.close();
-    },
-  };
 }
 
 async function findPageTargets(port) {
-  const response = await fetch(
-    `http://${DEFAULT_CDP_HOST}:${port}/json/list`,
-  );
-
-  if (!response.ok) {
-    throw new CliError(`CDP target discovery failed with ${response.status}.`);
-  }
-
-  const targets = await response.json();
-  return targets.filter(
-    (target) => target.type === 'page' && !target.url.startsWith('chrome'),
-  );
+  return findCorePageTargets({
+    host: DEFAULT_CDP_HOST,
+    port,
+    errorFactory: (message) => new CliError(message),
+  });
 }
 
 async function connectToPage(pageWebsocketUrl) {
@@ -936,113 +782,49 @@ async function connectToPage(pageWebsocketUrl) {
 }
 
 async function evaluate(cdp, expression, timeoutMs = DEFAULT_CDP_TIMEOUT_MS) {
-  const result = await cdp.send(
-    'Runtime.evaluate',
-    {
-      expression,
-      returnByValue: true,
-      awaitPromise: true,
-    },
+  return evaluateWithCdp(cdp, expression, {
     timeoutMs,
-  );
-
-  if (result.exceptionDetails) {
-    throw new CliError(`Evaluation failed: ${result.exceptionDetails.text}`);
-  }
-
-  return result.result.value;
+    errorFactory: (message) => new CliError(message),
+  });
 }
 
 async function waitForBrowserDebugEndpoint(port) {
-  const deadline = Date.now() + DEFAULT_BROWSER_READY_TIMEOUT_MS;
-
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetch(
-        `http://${DEFAULT_CDP_HOST}:${port}/json/version`,
-      );
-      if (response.ok) {
-        return;
-      }
-    } catch {
-      // Keep polling until the deadline.
-    }
-
-    await sleep(500);
-  }
-
-  throw new CliError(
-    'The browser did not finish opening the temporary controlled window.',
-  );
+  return waitForCoreBrowserDebugEndpoint({
+    host: DEFAULT_CDP_HOST,
+    port,
+    timeoutMs: DEFAULT_BROWSER_READY_TIMEOUT_MS,
+    errorFactory: (message) => new CliError(message),
+  });
 }
 
 async function waitForBrowserPageTarget(
   port,
   timeoutMs = DEFAULT_BROWSER_READY_TIMEOUT_MS,
 ) {
-  const deadline = Date.now() + timeoutMs;
-
-  while (Date.now() < deadline) {
-    try {
-      const pages = await findPageTargets(port);
-      if (pages.length > 0) {
-        return pages;
-      }
-    } catch {
-      // Keep polling until the deadline.
-    }
-
-    await sleep(500);
-  }
-
-  throw new CliError(
-    'The browser opened, but no tab window became available.',
-  );
-}
-
-async function isBrowserDebugEndpointAvailable(port) {
-  try {
-    const response = await fetch(
-      `http://${DEFAULT_CDP_HOST}:${port}/json/version`,
-    );
-    return response.ok;
-  } catch {
-    return false;
-  }
+  return waitForCoreBrowserPageTarget({
+    host: DEFAULT_CDP_HOST,
+    port,
+    timeoutMs,
+    errorFactory: (message) => new CliError(message),
+  });
 }
 
 async function waitForBrowserDebugEndpointToClose(
   port,
   timeoutMs = DEFAULT_BROWSER_SHUTDOWN_TIMEOUT_MS,
 ) {
-  const deadline = Date.now() + timeoutMs;
-
-  while (Date.now() < deadline) {
-    const isAvailable = await isBrowserDebugEndpointAvailable(port);
-    if (!isAvailable) {
-      return true;
-    }
-
-    await sleep(250);
-  }
-
-  return !(await isBrowserDebugEndpointAvailable(port));
+  return waitForCoreBrowserDebugEndpointToClose({
+    host: DEFAULT_CDP_HOST,
+    port,
+    timeoutMs,
+  });
 }
 
 async function getBrowserDebuggerWebSocketUrl(port) {
-  try {
-    const response = await fetch(
-      `http://${DEFAULT_CDP_HOST}:${port}/json/version`,
-    );
-    if (!response.ok) {
-      return '';
-    }
-
-    const payload = await response.json();
-    return String(payload.webSocketDebuggerUrl || '');
-  } catch {
-    return '';
-  }
+  return getCoreBrowserDebuggerWebSocketUrl({
+    host: DEFAULT_CDP_HOST,
+    port,
+  });
 }
 
 function getBrowserConfigs() {
@@ -1258,7 +1040,7 @@ async function ensureBrowserIsClosed(prompt, browser) {
   while (isBrowserRunning(browser.processName)) {
     console.log(`\n${browser.name} is still running.`);
     console.log(
-      'Close it so the extractor can reopen that profile in a temporary controlled window.',
+      'Close it so the extractor can relaunch the selected profile in debug mode.',
     );
     await prompt.waitForEnter('\nPress Enter after the browser is closed...\n');
   }
@@ -2397,7 +2179,7 @@ async function selectTranscriptPage(prompt, debugPort) {
 
   if (pages.length === 0) {
     throw new CliError(
-      'No browser tabs were found. Open the Stream meeting, then try again.',
+      'No browser pages were found. Open Microsoft Stream before continuing.',
     );
   }
 
@@ -2415,14 +2197,14 @@ async function selectTranscriptPage(prompt, debugPort) {
     'Open pages',
     pages,
     (page) => `${page.title} (${page.url.slice(0, 80)})`,
-    '\nWhich tab has the Stream meeting? (number): ',
+    '\nWhich page contains the transcript? (number): ',
   );
 }
 
 function printRunInstructions() {
-  console.log('\nBrowser window is ready.');
+  console.log('\nBrowser is ready.');
   console.log('1. Open the meeting in Microsoft Stream.');
-  console.log('2. Open the Transcript panel and let it finish loading.');
+  console.log('2. Open the Transcript panel.');
   console.log('3. Return to this terminal and continue.');
 }
 
@@ -2472,23 +2254,21 @@ async function runDomMode() {
     tempDataDir = join(tmpdir(), `stream-transcript-extractor-${Date.now()}`);
     mkdirSync(tempDataDir, { recursive: true });
 
-    console.log('Setting up a temporary browser session...');
+    console.log('Preparing temporary browser profile...');
     prepareTempProfile(browser.basePath, profile, tempDataDir);
 
-    console.log(`Starting ${browser.name}...`);
+    console.log(`Launching ${browser.name} on debug port ${debugPort}...`);
     browserProcess = launchBrowser(browser, profile, tempDataDir, debugPort);
 
-    console.log('Waiting for the browser window to finish opening...');
+    console.log('Waiting for the browser debug endpoint...');
     await waitForBrowserDebugEndpoint(debugPort);
     await waitForBrowserPageTarget(debugPort);
 
     printRunInstructions();
-    await prompt.waitForEnter(
-      '\nPress Enter when the Stream tab and Transcript panel are ready...\n',
-    );
+    await prompt.waitForEnter('\nPress Enter to start extracting...\n');
 
     targetPage = await selectTranscriptPage(prompt, debugPort);
-    console.log(`\nUsing tab: ${targetPage.title}`);
+    console.log(`\nConnecting to: ${targetPage.title}`);
 
     cdp = await connectToPage(targetPage.webSocketDebuggerUrl);
 
@@ -2518,7 +2298,7 @@ async function runDomMode() {
           error: extractionResult.error,
         });
         const debugPath = saveDebugOutput(debugPayload, failureOutputBasePath);
-        console.log(`Saved diagnostic file: ${debugPath}`);
+        console.log(`Saved debug output to: ${debugPath}`);
       }
 
       throw new CliError(extractionResult.error);
@@ -2526,8 +2306,8 @@ async function runDomMode() {
 
     const entries = extractionResult.entries;
     console.log(
-      `Scrolled ${extractionResult.scrollCount} times. ` +
-        `Last timestamp seen: ${extractionResult.lastTimestamp || 'n/a'}.`,
+      `Scroll passes: ${extractionResult.scrollCount}, ` +
+        `last timestamp: ${extractionResult.lastTimestamp || 'n/a'}.`,
     );
     if (options.debug && extractionResult.debug) {
       console.log(
@@ -2556,7 +2336,7 @@ async function runDomMode() {
             'No transcript entries were found. Confirm the transcript panel is open and visible.',
         });
         const debugPath = saveDebugOutput(debugPayload, failureOutputBasePath);
-        console.log(`Saved diagnostic file: ${debugPath}`);
+        console.log(`Saved debug output to: ${debugPath}`);
       }
 
       throw new CliError(
@@ -2589,13 +2369,13 @@ async function runDomMode() {
       debugPath = saveDebugOutput(debugPayload, outputBasePath);
     }
 
-    console.log(`Extracted ${entries.length} transcript entries.`);
+    console.log(`Extracted ${entries.length} entries.`);
     console.log(`Speakers: ${outputPayload.speakers.join(', ')}`);
     for (const outputPath of outputPaths) {
-      console.log(`Saved transcript file: ${outputPath}`);
+      console.log(`Saved transcript to: ${outputPath}`);
     }
     if (debugPath) {
-      console.log(`Saved diagnostic file: ${debugPath}`);
+      console.log(`Saved debug output to: ${debugPath}`);
     }
 
     return 0;
@@ -2631,7 +2411,7 @@ async function runDomMode() {
  * shareable extractor implementation without leaking its internal helpers into
  * the DOM mode namespace.
  */
-const runEmbeddedNetworkMode = (() => {
+const networkModeRuntime = (() => {
   const APP_NAME = 'Stream Transcript Extractor (Network Mode)';
   const APP_DESCRIPTION =
     'Extract Microsoft Teams recording transcripts from Microsoft Stream ' +
@@ -2639,17 +2419,20 @@ const runEmbeddedNetworkMode = (() => {
   const SUPPORTED_BROWSER_KEYS = ['chrome', 'edge'];
   const SUPPORTED_OUTPUT_FORMATS = ['json', 'md', 'both'];
   const DEFAULT_OUTPUT_DIR = 'output';
+  const DEFAULT_CRAWL_START_URL =
+    'https://m365.cloud.microsoft/launch/Stream/?auth=2&home=1';
   const DEFAULT_CDP_HOST = '127.0.0.1';
   const DEFAULT_BROWSER_READY_TIMEOUT_MS = 15_000;
   const DEFAULT_CDP_TIMEOUT_MS = 30_000;
+  const DEFAULT_PAGE_NAVIGATION_TIMEOUT_MS = 45_000;
   const DEFAULT_CAPTURE_SETTLE_MS = 1_500;
+  const DEFAULT_CRAWL_SCROLL_SETTLE_MS = 1_000;
+  const DEFAULT_WAIT_BEFORE_DISCOVERY_MS = 10_000;
   const DEFAULT_BROWSER_SHUTDOWN_TIMEOUT_MS = 8_000;
   const DEFAULT_AUTOMATIC_UI_POLL_MS = 250;
-  const DEFAULT_AUTOMATIC_CONTROL_DISCOVERY_TIMEOUT_MS = 5_000;
   const DEFAULT_AUTOMATIC_PANEL_OPEN_TIMEOUT_MS = 7_500;
   const DEFAULT_AUTOMATIC_SIGNAL_TIMEOUT_MS = 8_000;
   const DEFAULT_AUTOMATIC_SIGNAL_RETRY_TIMEOUT_MS = 6_000;
-  const DEFAULT_AUTOMATIC_FINAL_REOPEN_SIGNAL_TIMEOUT_MS = 10_000;
   const DEFAULT_AUTOMATIC_REQUEST_SETTLE_TIMEOUT_MS = 8_000;
   const DEFAULT_AUTOMATIC_CLICK_SETTLE_MS = 750;
   const MAX_TRACKED_RESPONSES = 150;
@@ -2663,16 +2446,18 @@ const runEmbeddedNetworkMode = (() => {
   const MAX_DEBUG_WEBSOCKET_FRAMES = 400;
   const MAX_DEBUG_FRAME_PREVIEW_LENGTH = 4_000;
   const MAX_DEBUG_POST_DATA_PREVIEW_LENGTH = 4_000;
-  
+  const MAX_DISCOVERY_RESPONSE_BODIES = 200;
+  const CRAWL_STATE_VERSION = 1;
+
   const BUILD_VERSION =
     typeof __BUILD_VERSION__ === 'string' ? __BUILD_VERSION__ : 'dev';
   const BUILD_TIME =
     typeof __BUILD_TIME__ === 'string' ? __BUILD_TIME__ : '';
-  
+
   const CURRENT_PLATFORM = platform();
   const IS_WINDOWS = CURRENT_PLATFORM === 'win32';
   const IS_MACOS = CURRENT_PLATFORM === 'darwin';
-  
+
   /**
    * @typedef {Object} CliOptions
    * @property {string} browser
@@ -2686,7 +2471,7 @@ const runEmbeddedNetworkMode = (() => {
    * @property {boolean} help
    * @property {boolean} version
    */
-  
+
   /**
    * @typedef {Object} BrowserProfile
    * @property {string} dirName
@@ -2696,7 +2481,7 @@ const runEmbeddedNetworkMode = (() => {
    * @property {string} email
    * @property {string} path
    */
-  
+
   /**
    * @typedef {Object} BrowserConfig
    * @property {string} key
@@ -2707,14 +2492,14 @@ const runEmbeddedNetworkMode = (() => {
    * @property {string} binary
    * @property {BrowserProfile[]} profiles
    */
-  
+
   /**
    * @typedef {Object} TranscriptEntry
    * @property {string} speaker
    * @property {string} timestamp
    * @property {string} text
    */
-  
+
   class CliError extends Error {
     /**
      * @param {string} message
@@ -2726,179 +2511,320 @@ const runEmbeddedNetworkMode = (() => {
       this.exitCode = exitCode;
     }
   }
-  
+
   function sleep(ms) {
     return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
   }
-  
-  function readOptionValue(flag, inlineValue, nextArg) {
-    const value = inlineValue ?? nextArg;
-  
-    if (
-      value == null ||
-      value === '' ||
-      (inlineValue == null && String(value).startsWith('--'))
-    ) {
-      throw new CliError(`Missing value for ${flag}.`);
-    }
-  
-    return value;
-  }
-  
+
   /**
    * @param {string[]} argv
    * @returns {CliOptions}
    */
   function parseArgs(argv) {
-    /** @type {CliOptions} */
-    const options = {
-      browser: '',
-      profile: '',
-      outputName: '',
-      outputDir: DEFAULT_OUTPUT_DIR,
-      outputFormat: DEFAULT_OUTPUT_FORMAT,
-      debugPort: null,
-      debug: false,
-      keepBrowserOpen: false,
-      help: false,
-      version: false,
-    };
-  
-    for (let index = 0; index < argv.length; index += 1) {
-      const arg = argv[index];
-  
-      if (arg === '--help' || arg === '-h') {
-        options.help = true;
-        continue;
-      }
-  
-      if (arg === '--version' || arg === '-v') {
-        options.version = true;
-        continue;
-      }
-  
-      if (arg === '--keep-browser-open') {
-        options.keepBrowserOpen = true;
-        continue;
-      }
-  
-      if (arg === '--debug') {
-        options.debug = true;
-        continue;
-      }
-  
-      if (!arg.startsWith('--')) {
-        throw new CliError(`Unexpected positional argument "${arg}".`);
-      }
-  
-      const [flag, inlineValue] = arg.split(/=(.*)/s, 2);
-      const value = readOptionValue(flag, inlineValue, argv[index + 1]);
-  
-      if (flag === '--browser') {
-        options.browser = normalizeBrowserKey(value);
-      } else if (flag === '--profile') {
-        options.profile = value;
-      } else if (flag === '--output') {
-        options.outputName = value;
-      } else if (flag === '--output-dir') {
-        options.outputDir = value;
-      } else if (flag === '--format') {
-        options.outputFormat = String(value).trim().toLowerCase();
-      } else if (flag === '--debug-port') {
-        const parsedPort = Number.parseInt(value, 10);
-        if (!Number.isInteger(parsedPort) || parsedPort < 1 || parsedPort > 65_535) {
-          throw new CliError(`Invalid port "${value}".`);
-        }
-        options.debugPort = parsedPort;
-      } else {
-        throw new CliError(`Unknown option "${flag}".`);
-      }
-  
-      if (inlineValue == null) {
-        index += 1;
-      }
-    }
-  
-    if (
-      options.browser &&
-      !SUPPORTED_BROWSER_KEYS.includes(options.browser)
-    ) {
-      throw new CliError(
-        `Unsupported browser "${options.browser}". Use one of: ` +
-          `${SUPPORTED_BROWSER_KEYS.join(', ')}.`,
-      );
-    }
-  
-    if (!SUPPORTED_OUTPUT_FORMATS.includes(options.outputFormat)) {
-      throw new CliError(
-        `Unsupported output format "${options.outputFormat}". Use one of: ` +
-          `${SUPPORTED_OUTPUT_FORMATS.join(', ')}.`,
-      );
-    }
-  
-    return options;
+    return parseSharedCliArgs(argv, {
+      defaults: {
+        browser: '',
+        profile: '',
+        outputName: '',
+        outputDir: DEFAULT_OUTPUT_DIR,
+        outputFormat: DEFAULT_TRANSCRIPT_OUTPUT_FORMAT,
+        debugPort: null,
+        debug: false,
+        keepBrowserOpen: false,
+        help: false,
+        version: false,
+      },
+      supportedBrowserKeys: SUPPORTED_BROWSER_KEYS,
+      supportedOutputFormats: SUPPORTED_OUTPUT_FORMATS,
+      normalizeBrowserKey,
+      errorFactory: (message) => new CliError(message),
+    });
   }
-  
+
   function printHelp() {
-    console.log(`${APP_NAME}`);
-    console.log(`${APP_DESCRIPTION}\n`);
-    console.log('Usage:');
-    console.log('  bun extract.js --mode <network|automatic> [options]');
-    console.log('  ./<compiled-binary> [options]\n');
-    console.log('Guided setup:');
-    console.log(
-      '  Run with no flags in an interactive terminal to choose mode, browser, profile,',
-    );
-    console.log(
-      '  output settings, diagnostics, and browser shutdown behavior through menus.\n',
-    );
-    console.log('  Press Enter in guided menus to accept the recommended choice.\n');
-    console.log('Options:');
-    console.log('  --browser <chrome|edge>  Use a specific browser instead of the menu.');
-    console.log('  --profile <query>        Match a profile by name, email, or directory.');
-    console.log('  --output <name>          Override the output filename prefix.');
-    console.log('  --output-dir <path>      Write files to a custom directory.');
-    console.log(
-      `  --format <json|md|both>  Choose JSON, Markdown, or both outputs (default: ${DEFAULT_OUTPUT_FORMAT}).`,
-    );
-    console.log('  --debug-port <port>      Force a specific browser control port.');
-    console.log(
-      '  --debug                  Save extended network diagnostics, including ' +
-        'request/response lifecycle data, candidate bodies, and WebSocket frames.',
-    );
-    console.log(
-      '                           In automatic mode, --debug also prints each UI',
-    );
-    console.log(
-      '                           action, retry, and fallback reason.',
-    );
-    console.log('  --keep-browser-open      Leave the launched browser open after extraction.');
-    console.log('  --version, -v            Print the build version.');
-    console.log('  --help, -h               Show this help text.\n');
-    console.log('Capture flow:');
-    console.log(
-      '  network: open the Stream page first with the Transcript panel closed.',
-    );
-    console.log(
-      '  automatic: let the extractor reload the page, try the Transcript panel',
-    );
-    console.log(
-      '             automatically, retry the panel actions, then keep capture',
-    );
-    console.log(
-      '             armed while it asks for any manual fallback.',
-    );
+    printHelpScreen({
+      name: APP_NAME,
+      summary: APP_DESCRIPTION,
+      usage: [
+        'bun ./extract.js --mode <network|automatic> [options]',
+        './stream-transcript-extractor-<target> [options]',
+      ],
+      sections: [
+        {
+          title: 'Recommended path',
+          rows: [
+            {
+              label: 'automatic (recommended default)',
+              description:
+                'Recommended for first success. Reload with capture armed, try the Transcript panel automatically, and only ask for manual help outside batch mode when the page still needs it.',
+              },
+            {
+              label: 'network (advanced)',
+              description:
+                'Use when you want the lowest-level network capture flow and are comfortable opening the Transcript panel yourself after arming capture.',
+            },
+          ],
+        },
+        {
+          title: 'Recommended settings',
+          rows: [
+            {
+              label: '--format md',
+              description:
+                'Recommended and default transcript output for review, sharing, and follow-up editing.',
+            },
+            {
+              label: '--debug off',
+              description:
+                'Recommended normal path. Turn on --debug only when you want deeper diagnostics or a saved network trace for triage.',
+            },
+          ],
+        },
+        {
+          title: 'Options',
+          rows: [
+            { label: '--browser <chrome|edge>', description: 'Use a specific browser.' },
+            {
+              label: '--profile <query>',
+              description: 'Match a profile by name, email, or directory.',
+            },
+            {
+              label: '--output <name>',
+              description: 'Override the transcript filename prefix.',
+            },
+            {
+              label: '--output-dir <path>',
+              description: 'Write files to a custom directory.',
+            },
+            {
+              label: '--format <json|md|both>',
+              description:
+                'Choose JSON, Markdown, or both outputs. Recommended and default: md.',
+            },
+            {
+              label: '--debug-port <port>',
+              description: 'Force a specific remote-debugging port.',
+            },
+            {
+              label: '--debug',
+              description:
+                'Save extended network diagnostics, including candidate bodies and the automatic action trace. Recommended default: off.',
+            },
+            {
+              label: '--keep-browser-open',
+              description: 'Leave the launched browser open after extraction.',
+            },
+            { label: '--version, -v', description: 'Print the build version.' },
+            { label: '--help, -h', description: 'Show this help text.' },
+          ],
+        },
+        {
+          title: 'Examples',
+          lines: [
+            'bun ./extract.js --mode automatic --browser chrome --profile Work',
+            'bun ./extract.js --mode automatic --format md',
+            'bun ./extract.js --mode network --debug --output-dir ./exports',
+          ],
+        },
+      ],
+    });
   }
-  
+
+  function parseCrawlerArgs(argv) {
+    return parseSharedCliArgs(argv, {
+      defaults: {
+        browser: '',
+        profile: '',
+        outputName: '',
+        outputDir: DEFAULT_OUTPUT_DIR,
+        outputFormat: DEFAULT_TRANSCRIPT_OUTPUT_FORMAT,
+        debugPort: null,
+        debug: false,
+        keepBrowserOpen: false,
+        help: false,
+        version: false,
+        startUrl: DEFAULT_CRAWL_START_URL,
+        stateFile: '',
+        selectionSpec: '',
+        waitBeforeDiscoveryMs: DEFAULT_WAIT_BEFORE_DISCOVERY_MS,
+      },
+      supportedBrowserKeys: SUPPORTED_BROWSER_KEYS,
+      supportedOutputFormats: SUPPORTED_OUTPUT_FORMATS,
+      normalizeBrowserKey,
+      errorFactory: (message) => new CliError(message),
+      extraOptions: [
+        {
+          flag: '--start-url',
+          key: 'startUrl',
+          normalize: (value) => String(value).trim(),
+          validate: (value, _options, errorFactory) => {
+            if (!value) {
+              throw errorFactory
+                ? errorFactory('Missing value for --start-url.')
+                : new Error('Missing value for --start-url.');
+            }
+          },
+        },
+        {
+          flag: '--state-file',
+          key: 'stateFile',
+          normalize: (value) => String(value).trim(),
+        },
+        {
+          flag: '--select',
+          key: 'selectionSpec',
+          normalize: (value) => String(value).trim(),
+        },
+        {
+          flag: '--wait-before-discovery-ms',
+          key: 'waitBeforeDiscoveryMs',
+          normalize: (value) => {
+            const parsed = Number.parseInt(String(value).trim(), 10);
+            if (!Number.isInteger(parsed) || parsed < 0) {
+              throw new CliError(
+                `Invalid wait duration "${value}" for --wait-before-discovery-ms.`,
+              );
+            }
+            return parsed;
+          },
+        },
+      ],
+    });
+  }
+
+  function printCrawlerHelp() {
+    printHelpScreen({
+      name: 'Stream Transcript Extractor (Crawl Workflow)',
+      summary:
+        'Discover meeting pages from the Stream Meetings view, queue them in a persistent state file, and reuse one browser session to batch-extract transcripts with the automatic extractor.',
+      usage: [
+        'bun ./extract.js crawl [options]',
+        './stream-transcript-extractor-<target> crawl [options]',
+      ],
+      sections: [
+        {
+          title: 'Recommended path',
+          rows: [
+            {
+              label: 'bun ./extract.js crawl',
+              description:
+                'Open Stream home, wait the default 10-second settle window, switch to Meetings, scroll the rendered list, merge the results into *.state.json, let you select items from the queue, then extract each selected meeting with the automatic extractor in the same browser session.',
+            },
+          ],
+        },
+        {
+          title: 'How crawl works',
+          lines: [
+            '1. Open Stream home and wait the default 10-second settle window for auth and page load.',
+            '2. Select the Meetings view and scroll until the rendered list stops growing.',
+            '3. Merge discovered recordings into the persistent *.state.json queue and let you select items in the terminal.',
+            '4. Reuse the same browser debug session to run automatic extraction against each selected meeting, then write updated queue state and a *.batch.json run summary.',
+          ],
+        },
+        {
+          title: 'Selection syntax',
+          lines: [
+            'Use comma-separated indexes and ranges such as 1-5,8,10.',
+            'Press Enter to select items that are not yet successful, or use keywords such as new, failed, done, or all.',
+            'The crawler keeps a persistent *.state.json queue, keeps running after item-level failures, and also writes a *.batch.json status summary for the current run.',
+          ],
+        },
+        {
+          title: 'Recommended settings',
+          rows: [
+            {
+              label: '--format md',
+              description:
+                'Recommended and default transcript output for the crawl workflow. Use json for automation or both when you need both forms.',
+            },
+            {
+              label: '--debug off',
+              description:
+                'Recommended normal path. Turn on --debug only when diagnosing failed items or validating suspicious captures.',
+            },
+          ],
+        },
+        {
+          title: 'Options',
+          rows: [
+            { label: '--browser <chrome|edge>', description: 'Use a specific browser.' },
+            {
+              label: '--profile <query>',
+              description: 'Match a profile by name, email, or directory.',
+            },
+            {
+              label: '--start-url <url>',
+              description: `Override the Stream entry URL. Default: ${DEFAULT_CRAWL_START_URL}.`,
+            },
+            {
+              label: '--state-file <path>',
+              description: 'Override the persistent crawl queue state file.',
+            },
+            {
+              label: '--select <spec>',
+              description:
+                'Select items non-interactively with pending, new, failed, done, all, or numeric ranges.',
+            },
+            {
+              label: '--wait-before-discovery-ms <ms>',
+              description:
+                `Delay discovery after the Stream URL opens so auth and page load can settle. Default: ${DEFAULT_WAIT_BEFORE_DISCOVERY_MS}.`,
+            },
+            {
+              label: '--output <name>',
+              description:
+                'Override the batch status filename prefix. Transcript filenames still use each meeting title.',
+            },
+            {
+              label: '--output-dir <path>',
+              description: 'Write transcripts and batch status files here.',
+            },
+            {
+              label: '--format <json|md|both>',
+              description:
+                'Choose JSON, Markdown, or both transcript outputs. Recommended and default: md.',
+            },
+            {
+              label: '--debug-port <port>',
+              description: 'Force a specific remote-debugging port.',
+            },
+            {
+              label: '--debug',
+              description:
+                'Save extended network diagnostics for each item. Recommended default: off.',
+            },
+            {
+              label: '--keep-browser-open',
+              description: 'Leave the launched browser open after the batch.',
+            },
+            { label: '--version, -v', description: 'Print the build version.' },
+            { label: '--help, -h', description: 'Show this help text.' },
+          ],
+        },
+        {
+          title: 'Examples',
+          lines: [
+            'bun ./extract.js crawl --browser chrome --profile Work',
+            'bun ./extract.js crawl --state-file ./exports/team.state.json',
+            'bun ./extract.js crawl --select pending --browser edge',
+            `bun ./extract.js crawl --wait-before-discovery-ms ${DEFAULT_WAIT_BEFORE_DISCOVERY_MS} --browser edge`,
+            'bun ./extract.js crawl --output-dir ./exports --format md',
+            'bun ./extract.js crawl --output-dir ./exports --format both --debug',
+          ],
+        },
+      ],
+    });
+  }
+
   function printVersion() {
     const buildSuffix = BUILD_TIME ? ` (${BUILD_TIME})` : '';
     console.log(`${APP_NAME} ${BUILD_VERSION}${buildSuffix}`);
   }
-  
+
   function normalizeBrowserKey(value) {
     return String(value).trim().toLowerCase();
   }
-  
+
   function ensureSupportedPlatform() {
     if (!IS_MACOS && !IS_WINDOWS) {
       throw new CliError(
@@ -2906,41 +2832,11 @@ const runEmbeddedNetworkMode = (() => {
       );
     }
   }
-  
+
   function createPrompt() {
-    const readline = createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
-  
-    return {
-      ask(question) {
-        return new Promise((resolveAnswer) =>
-          readline.question(question, resolveAnswer),
-        );
-      },
-      waitForEnter(message = 'Press Enter to continue...') {
-        return new Promise((resolveAnswer) =>
-          readline.question(message, () => resolveAnswer()),
-        );
-      },
-      close() {
-        readline.close();
-      },
-    };
+    return createCliPrompt();
   }
-  
-  /**
-   * @param {string} title
-   * @param {string[]} items
-   */
-  function printMenu(title, items) {
-    console.log(`\n${title}`);
-    items.forEach((item, index) => {
-      console.log(`  ${index + 1}. ${item}`);
-    });
-  }
-  
+
   /**
    * @template T
    * @param {{ ask: (question: string) => Promise<string> }} prompt
@@ -2951,25 +2847,50 @@ const runEmbeddedNetworkMode = (() => {
    * @returns {Promise<T>}
    */
   async function chooseFromList(prompt, title, items, renderItem, question) {
-    printMenu(title, items.map(renderItem));
-  
-    while (true) {
-      const answer = (await prompt.ask(question)).trim();
-      const selectedIndex = Number.parseInt(answer, 10) - 1;
-      const selectedItem = items[selectedIndex];
-  
-      if (selectedItem) {
-        return selectedItem;
-      }
-  
-      console.log('Enter one of the listed numbers.');
-    }
+    return chooseCliFromList(prompt, title, items, renderItem, question);
   }
-  
+
+  function trimForTerminal(value, maxLength = 120) {
+    const text = String(value || '').replace(/\s+/g, ' ').trim();
+
+    if (!text || text.length <= maxLength) {
+      return text;
+    }
+
+    return `${text.slice(0, maxLength - 3)}...`;
+  }
+
+  function parseSelectionSpec(value, itemCount) {
+    return parseCliSelectionSpec(
+      value,
+      itemCount,
+      (message) => new CliError(message),
+    );
+  }
+
+  async function chooseManyFromList(
+    prompt,
+    title,
+    items,
+    renderItem,
+    question,
+    config = {},
+  ) {
+    return chooseCliManyFromList(
+      prompt,
+      title,
+      items,
+      renderItem,
+      question,
+      (message) => new CliError(message),
+      config,
+    );
+  }
+
   async function findAvailablePort(requestedPort) {
     return new Promise((resolvePort, rejectPort) => {
       const server = createServer();
-  
+
       server.unref();
       server.on('error', (error) => {
         const reason =
@@ -2978,7 +2899,7 @@ const runEmbeddedNetworkMode = (() => {
             : `Port ${requestedPort} is not available.`;
         rejectPort(new CliError(`${reason} ${error.message}`));
       });
-  
+
       server.listen(requestedPort ?? 0, DEFAULT_CDP_HOST, () => {
         const address = server.address();
         if (address == null || typeof address === 'string') {
@@ -2987,278 +2908,88 @@ const runEmbeddedNetworkMode = (() => {
           );
           return;
         }
-  
+
         const { port } = address;
         server.close((closeError) => {
           if (closeError) {
             rejectPort(new CliError(closeError.message));
             return;
           }
-  
+
           resolvePort(port);
         });
       });
     });
   }
-  
+
   /**
    * @param {string} websocketUrl
    */
   async function connectCdp(websocketUrl) {
-    const websocket = new WebSocket(websocketUrl);
-    const pendingRequests = new Map();
-    const eventHandlers = new Map();
-    let nextMessageId = 0;
-  
-    await new Promise((resolveConnection, rejectConnection) => {
-      const timeout = setTimeout(() => {
-        rejectConnection(new CliError('WebSocket connection timeout.'));
-      }, 10_000);
-  
-      websocket.onopen = () => {
-        clearTimeout(timeout);
-        resolveConnection();
-      };
-  
-      websocket.onerror = (event) => {
-        clearTimeout(timeout);
-        rejectConnection(
-          new CliError(
-            `WebSocket connection failed: ${event.message || 'unknown error'}.`,
-          ),
-        );
-      };
+    return connectCoreCdp(websocketUrl, {
+      defaultTimeoutMs: DEFAULT_CDP_TIMEOUT_MS,
+      errorFactory: (message) => new CliError(message),
     });
-  
-    websocket.onmessage = (event) => {
-      const payload = JSON.parse(event.data);
-  
-      if (payload.id && pendingRequests.has(payload.id)) {
-        const { resolveRequest, rejectRequest, timeout } =
-          pendingRequests.get(payload.id);
-        clearTimeout(timeout);
-        pendingRequests.delete(payload.id);
-  
-        if (payload.error) {
-          rejectRequest(
-            new CliError(`CDP request failed: ${payload.error.message}`),
-          );
-          return;
-        }
-  
-        resolveRequest(payload.result);
-        return;
-      }
-  
-      if (!payload.method) {
-        return;
-      }
-  
-      const handlers = eventHandlers.get(payload.method);
-      if (!handlers || handlers.size === 0) {
-        return;
-      }
-  
-      for (const handler of handlers) {
-        try {
-          handler(payload.params || {});
-        } catch {
-          // Ignore individual event handler failures so capture can continue.
-        }
-      }
-    };
-  
-    websocket.onclose = () => {
-      for (const [requestId, request] of pendingRequests.entries()) {
-        clearTimeout(request.timeout);
-        request.rejectRequest(
-          new CliError(`CDP connection closed before request ${requestId} completed.`),
-        );
-        pendingRequests.delete(requestId);
-      }
-    };
-  
-    return {
-      send(method, params = {}, timeoutMs = DEFAULT_CDP_TIMEOUT_MS) {
-        const messageId = nextMessageId + 1;
-        nextMessageId = messageId;
-  
-        return new Promise((resolveRequest, rejectRequest) => {
-          const timeout = setTimeout(() => {
-            pendingRequests.delete(messageId);
-            rejectRequest(new CliError(`CDP ${method} timed out.`));
-          }, timeoutMs);
-  
-          pendingRequests.set(messageId, {
-            resolveRequest,
-            rejectRequest,
-            timeout,
-          });
-  
-          websocket.send(
-            JSON.stringify({
-              id: messageId,
-              method,
-              params,
-            }),
-          );
-        });
-      },
-      on(method, handler) {
-        if (!eventHandlers.has(method)) {
-          eventHandlers.set(method, new Set());
-        }
-  
-        const handlers = eventHandlers.get(method);
-        handlers.add(handler);
-  
-        return () => {
-          handlers.delete(handler);
-          if (handlers.size === 0) {
-            eventHandlers.delete(method);
-          }
-        };
-      },
-      close() {
-        for (const request of pendingRequests.values()) {
-          clearTimeout(request.timeout);
-        }
-        pendingRequests.clear();
-        eventHandlers.clear();
-        websocket.close();
-      },
-    };
   }
-  
+
   async function findPageTargets(port) {
-    const response = await fetch(
-      `http://${DEFAULT_CDP_HOST}:${port}/json/list`,
-    );
-  
-    if (!response.ok) {
-      throw new CliError(`CDP target discovery failed with ${response.status}.`);
-    }
-  
-    const targets = await response.json();
-    return targets.filter(
-      (target) => target.type === 'page' && !target.url.startsWith('chrome'),
-    );
+    return findCorePageTargets({
+      host: DEFAULT_CDP_HOST,
+      port,
+      errorFactory: (message) => new CliError(message),
+    });
   }
-  
+
   async function connectToPage(pageWebsocketUrl) {
     return connectCdp(pageWebsocketUrl);
   }
-  
+
   async function evaluate(cdp, expression, timeoutMs = DEFAULT_CDP_TIMEOUT_MS) {
-    const result = await cdp.send(
-      'Runtime.evaluate',
-      {
-        expression,
-        returnByValue: true,
-        awaitPromise: true,
-      },
+    return evaluateWithCdp(cdp, expression, {
       timeoutMs,
-    );
-  
-    if (result.exceptionDetails) {
-      throw new CliError(`Evaluation failed: ${result.exceptionDetails.text}`);
-    }
-  
-    return result.result.value;
+      errorFactory: (message) => new CliError(message),
+    });
   }
-  
+
   async function waitForBrowserDebugEndpoint(port) {
-    const deadline = Date.now() + DEFAULT_BROWSER_READY_TIMEOUT_MS;
-  
-    while (Date.now() < deadline) {
-      try {
-        const response = await fetch(
-          `http://${DEFAULT_CDP_HOST}:${port}/json/version`,
-        );
-        if (response.ok) {
-          return;
-        }
-      } catch {
-        // Keep polling until the deadline.
-      }
-  
-      await sleep(500);
-    }
-  
-    throw new CliError(
-      'The browser did not finish opening the temporary controlled window.',
-    );
+    return waitForCoreBrowserDebugEndpoint({
+      host: DEFAULT_CDP_HOST,
+      port,
+      timeoutMs: DEFAULT_BROWSER_READY_TIMEOUT_MS,
+      errorFactory: (message) => new CliError(message),
+    });
   }
-  
+
   async function waitForBrowserPageTarget(
     port,
     timeoutMs = DEFAULT_BROWSER_READY_TIMEOUT_MS,
   ) {
-    const deadline = Date.now() + timeoutMs;
-  
-    while (Date.now() < deadline) {
-      try {
-        const pages = await findPageTargets(port);
-        if (pages.length > 0) {
-          return pages;
-        }
-      } catch {
-        // Keep polling until the deadline.
-      }
-  
-      await sleep(500);
-    }
-  
-    throw new CliError(
-      'The browser opened, but no tab window became available.',
-    );
+    return waitForCoreBrowserPageTarget({
+      host: DEFAULT_CDP_HOST,
+      port,
+      timeoutMs,
+      errorFactory: (message) => new CliError(message),
+    });
   }
-  
-  async function isBrowserDebugEndpointAvailable(port) {
-    try {
-      const response = await fetch(
-        `http://${DEFAULT_CDP_HOST}:${port}/json/version`,
-      );
-      return response.ok;
-    } catch {
-      return false;
-    }
-  }
-  
+
   async function waitForBrowserDebugEndpointToClose(
     port,
     timeoutMs = DEFAULT_BROWSER_SHUTDOWN_TIMEOUT_MS,
   ) {
-    const deadline = Date.now() + timeoutMs;
-  
-    while (Date.now() < deadline) {
-      const isAvailable = await isBrowserDebugEndpointAvailable(port);
-      if (!isAvailable) {
-        return true;
-      }
-  
-      await sleep(250);
-    }
-  
-    return !(await isBrowserDebugEndpointAvailable(port));
+    return waitForCoreBrowserDebugEndpointToClose({
+      host: DEFAULT_CDP_HOST,
+      port,
+      timeoutMs,
+    });
   }
-  
+
   async function getBrowserDebuggerWebSocketUrl(port) {
-    try {
-      const response = await fetch(
-        `http://${DEFAULT_CDP_HOST}:${port}/json/version`,
-      );
-      if (!response.ok) {
-        return '';
-      }
-  
-      const payload = await response.json();
-      return String(payload.webSocketDebuggerUrl || '');
-    } catch {
-      return '';
-    }
+    return getCoreBrowserDebuggerWebSocketUrl({
+      host: DEFAULT_CDP_HOST,
+      port,
+    });
   }
-  
+
   function getBrowserConfigs() {
     if (IS_WINDOWS) {
       const localAppData =
@@ -3267,7 +2998,7 @@ const runEmbeddedNetworkMode = (() => {
         process.env.ProgramFiles || 'C:\\Program Files';
       const programFilesX86 =
         process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
-  
+
       return {
         chrome: {
           key: 'chrome',
@@ -3304,7 +3035,7 @@ const runEmbeddedNetworkMode = (() => {
         },
       };
     }
-  
+
     return {
       chrome: {
         key: 'chrome',
@@ -3337,17 +3068,17 @@ const runEmbeddedNetworkMode = (() => {
       },
     };
   }
-  
+
   function findBrowserBinary(paths) {
     for (const filePath of paths) {
       if (existsSync(filePath)) {
         return filePath;
       }
     }
-  
+
     return null;
   }
-  
+
   function readProfileInfoCache(basePath) {
     try {
       const localState = JSON.parse(
@@ -3358,31 +3089,31 @@ const runEmbeddedNetworkMode = (() => {
       return {};
     }
   }
-  
+
   /**
    * @param {string} basePath
    * @returns {BrowserProfile[]}
    */
   function discoverProfiles(basePath) {
     const infoCache = readProfileInfoCache(basePath);
-  
+
     /** @type {BrowserProfile[]} */
     const profiles = [];
-  
+
     let entries;
     try {
       entries = readdirSync(basePath);
     } catch {
       return profiles;
     }
-  
+
     for (const entry of entries) {
       if (entry !== 'Default' && !entry.startsWith('Profile ')) {
         continue;
       }
-  
+
       const entryPath = join(basePath, entry);
-  
+
       try {
         if (!statSync(entryPath).isDirectory()) {
           continue;
@@ -3390,14 +3121,14 @@ const runEmbeddedNetworkMode = (() => {
       } catch {
         continue;
       }
-  
+
       if (
         !existsSync(join(entryPath, 'Preferences')) &&
         !existsSync(join(entryPath, 'Cookies'))
       ) {
         continue;
       }
-  
+
       const info = infoCache[entry] || {};
       const profileName = info.name || '';
       const email = info.user_name || '';
@@ -3405,7 +3136,7 @@ const runEmbeddedNetworkMode = (() => {
         profileName && email
           ? `${profileName} (${email})`
           : profileName || email || entry;
-  
+
       profiles.push({
         dirName: entry,
         displayName,
@@ -3415,42 +3146,42 @@ const runEmbeddedNetworkMode = (() => {
         path: entryPath,
       });
     }
-  
+
     return profiles;
   }
-  
+
   /**
    * @returns {BrowserConfig[]}
    */
   function discoverBrowsers() {
     const configs = getBrowserConfigs();
     const browsers = [];
-  
+
     for (const config of Object.values(configs)) {
       if (!existsSync(config.basePath)) {
         continue;
       }
-  
+
       const binary = findBrowserBinary(config.binaryCandidates);
       if (!binary) {
         continue;
       }
-  
+
       const profiles = discoverProfiles(config.basePath);
       if (profiles.length === 0) {
         continue;
       }
-  
+
       browsers.push({
         ...config,
         binary,
         profiles,
       });
     }
-  
+
     return browsers;
   }
-  
+
   function isBrowserRunning(processName) {
     try {
       if (IS_WINDOWS) {
@@ -3460,26 +3191,24 @@ const runEmbeddedNetworkMode = (() => {
         ).toString();
         return output.includes(processName);
       }
-  
+
       execSync(`pgrep -x "${processName}"`, { stdio: 'pipe' });
       return true;
     } catch {
       return false;
     }
   }
-  
+
   async function ensureBrowserIsClosed(prompt, browser) {
     while (isBrowserRunning(browser.processName)) {
       console.log(`\n${browser.name} is still running.`);
       console.log(
-        'Close it so the extractor can reopen that profile in a temporary controlled window.',
+        'Close it so the extractor can relaunch the selected profile in debug mode.',
       );
-      await prompt.waitForEnter(
-        '\nPress Enter after the browser is closed...\n',
-      );
+      await prompt.waitForEnter('\nPress Enter after the browser is closed...\n');
     }
   }
-  
+
   /**
    * @param {BrowserProfile[]} profiles
    * @param {string} rawQuery
@@ -3499,18 +3228,18 @@ const runEmbeddedNetworkMode = (() => {
         .some((value) => value.toLowerCase().includes(query)),
     );
   }
-  
+
   async function selectBrowserAndProfile(options, prompt) {
     const browsers = discoverBrowsers();
-  
+
     if (browsers.length === 0) {
       throw new CliError(
         'No supported Chrome or Edge profiles were found on this machine.',
       );
     }
-  
+
     let browser = null;
-  
+
     if (options.browser) {
       browser = browsers.find(
         (candidate) => candidate.key === options.browser,
@@ -3533,9 +3262,9 @@ const runEmbeddedNetworkMode = (() => {
         '\nSelect browser (number): ',
       );
     }
-  
+
     let profile = null;
-  
+
     if (options.profile) {
       profile = findProfileMatch(browser.profiles, options.profile);
       if (!profile) {
@@ -3555,26 +3284,26 @@ const runEmbeddedNetworkMode = (() => {
         '\nSelect profile (number): ',
       );
     }
-  
+
     return { browser, profile };
   }
-  
+
   function prepareTempProfile(basePath, profile, tempDir) {
     const localStatePath = join(basePath, 'Local State');
     if (existsSync(localStatePath)) {
       cpSync(localStatePath, join(tempDir, 'Local State'));
     }
-  
+
     if (IS_WINDOWS) {
       cpSync(profile.path, join(tempDir, profile.dirName), {
         recursive: true,
       });
       return;
     }
-  
+
     symlinkSync(profile.path, join(tempDir, profile.dirName));
   }
-  
+
   function launchBrowser(browser, profile, tempDataDir, debugPort) {
     const browserArgs = [
       `--user-data-dir=${tempDataDir}`,
@@ -3587,31 +3316,31 @@ const runEmbeddedNetworkMode = (() => {
       '--new-window',
       'about:blank',
     ];
-  
+
     const browserProcess = spawn(browser.binary, browserArgs, {
       stdio: 'ignore',
       detached: !IS_WINDOWS,
       windowsHide: true,
     });
-  
+
     if (!IS_WINDOWS) {
       browserProcess.unref();
     }
-  
+
     return browserProcess;
   }
-  
+
   function stopProcess(pid) {
     if (!pid) {
       return;
     }
-  
+
     try {
       if (IS_WINDOWS) {
         execSync(`taskkill /PID ${pid} /F /T`, { stdio: 'pipe' });
         return;
       }
-  
+
       process.kill(-pid, 'SIGTERM');
     } catch {
       try {
@@ -3621,12 +3350,12 @@ const runEmbeddedNetworkMode = (() => {
       }
     }
   }
-  
+
   function isProcessRunning(pid) {
     if (!pid) {
       return false;
     }
-  
+
     try {
       if (IS_WINDOWS) {
         const output = execSync(`tasklist /FI "PID eq ${pid}" /NH`, {
@@ -3634,39 +3363,39 @@ const runEmbeddedNetworkMode = (() => {
         }).toString();
         return output.trim() !== '' && !output.includes('No tasks are running');
       }
-  
+
       process.kill(pid, 0);
       return true;
     } catch {
       return false;
     }
   }
-  
+
   async function waitForProcessExit(
     pid,
     timeoutMs = DEFAULT_BROWSER_SHUTDOWN_TIMEOUT_MS,
   ) {
     const deadline = Date.now() + timeoutMs;
-  
+
     while (Date.now() < deadline) {
       if (!isProcessRunning(pid)) {
         return true;
       }
-  
+
       await sleep(250);
     }
-  
+
     return !isProcessRunning(pid);
   }
-  
+
   async function closeBrowserViaCdp(debugPort) {
     const browserWebSocketUrl = await getBrowserDebuggerWebSocketUrl(debugPort);
     if (!browserWebSocketUrl) {
       return false;
     }
-  
+
     let browserCdp = null;
-  
+
     try {
       browserCdp = await connectCdp(browserWebSocketUrl);
       await browserCdp.send('Browser.close', {}, 5_000);
@@ -3677,30 +3406,30 @@ const runEmbeddedNetworkMode = (() => {
         browserCdp.close();
       }
     }
-  
+
     return waitForBrowserDebugEndpointToClose(debugPort);
   }
-  
+
   async function shutdownBrowser(browserProcess, debugPort) {
     let closed = false;
-  
+
     if (debugPort != null) {
       closed = await closeBrowserViaCdp(debugPort);
     }
-  
+
     if (!closed && browserProcess?.pid) {
       stopProcess(browserProcess.pid);
     }
-  
+
     if (browserProcess?.pid) {
       await waitForProcessExit(browserProcess.pid);
     }
-  
+
     if (!closed && debugPort != null) {
       await waitForBrowserDebugEndpointToClose(debugPort);
     }
   }
-  
+
   function isLikelyMeetingPage(page) {
     const haystack = [
       page?.title || '',
@@ -3708,12 +3437,12 @@ const runEmbeddedNetworkMode = (() => {
     ]
       .join(' ')
       .toLowerCase();
-  
+
     return /stream|sharepoint|recordings|meeting|transcript|stream\.aspx/.test(
       haystack,
     );
   }
-  
+
   function normalizeText(value) {
     return String(value || '')
       .replace(/\u200b/g, '')
@@ -3722,24 +3451,24 @@ const runEmbeddedNetworkMode = (() => {
       .replace(/\n{3,}/g, '\n\n')
       .trim();
   }
-  
+
   function normalizeInlineText(value) {
     return normalizeText(value).replace(/\s+/g, ' ').trim();
   }
-  
+
   function stripUtf8Bom(value) {
     return String(value || '').replace(/^\uFEFF/, '');
   }
-  
+
   function trimForPreview(value, maxLength = MAX_CANDIDATE_PREVIEW_LENGTH) {
     const text = String(value || '');
     if (text.length <= maxLength) {
       return text;
     }
-  
+
     return `${text.slice(0, maxLength - 3)}...`;
   }
-  
+
   function sanitizeHeaders(headers) {
     return Object.fromEntries(
       Object.entries(headers || {}).map(([key, value]) => [
@@ -3748,7 +3477,7 @@ const runEmbeddedNetworkMode = (() => {
       ]),
     );
   }
-  
+
   function lowerCaseHeaderMap(headers) {
     return Object.fromEntries(
       Object.entries(sanitizeHeaders(headers)).map(([key, value]) => [
@@ -3757,17 +3486,207 @@ const runEmbeddedNetworkMode = (() => {
       ]),
     );
   }
-  
+
   function isTextLikeContent(value) {
     return /json|text|xml|javascript|plain|html|vtt|caption|subtitle/.test(
       String(value || '').toLowerCase(),
     );
   }
-  
+
   function isStreamRelatedUrl(url) {
-    return /stream|microsoftstream|office\.com|office365\.com|office\.net|sharepoint\.com|teams\.microsoft\.com/.test(
+    return /stream|microsoftstream|m365\.cloud\.microsoft|substrate\.office\.com|officeapps\.live\.com|office\.com|office365\.com|office\.net|sharepoint\.com|teams\.microsoft\.com|graph\.microsoft\.com|meetingcatchupportal|cortana\.ai/.test(
       String(url || '').toLowerCase(),
     );
+  }
+
+  function containsTranscriptSignal(value) {
+    return /\btranscript(?:s)?\b|\bcaptions?\b|\bsubtitles?\b|\butterances?\b|\bspeakers?\b|\bspeech\b|\bvtt\b|\bclosedcaption(?:s)?\b/.test(
+      String(value || '').toLowerCase(),
+    );
+  }
+
+  function shouldTrackDebugTraffic({
+    url,
+    resourceType,
+    method = '',
+    headers = {},
+    postData = '',
+    captureAll = false,
+  }) {
+    if (captureAll) {
+      return true;
+    }
+
+    const lowerHeaders = lowerCaseHeaderMap(headers);
+    const haystack = [
+      url,
+      resourceType,
+      method,
+      lowerHeaders['content-type'] || '',
+      lowerHeaders.accept || '',
+      trimForPreview(postData, 400),
+    ]
+      .join(' ')
+      .toLowerCase();
+
+    if (containsTranscriptSignal(haystack)) {
+      return true;
+    }
+
+    if (!isStreamRelatedUrl(url)) {
+      return false;
+    }
+
+    return [
+      'Document',
+      'Fetch',
+      'XHR',
+      'WebSocket',
+      'EventSource',
+      'Other',
+      'Preflight',
+    ].includes(String(resourceType || ''));
+  }
+
+  function shouldFetchDebugResponseBody(responseRecord) {
+    if (!responseRecord || !responseRecord.finished || responseRecord.loadingFailure) {
+      return false;
+    }
+
+    const haystack = [
+      responseRecord.url,
+      responseRecord.mimeType,
+      responseRecord.contentType,
+    ].join(' ');
+
+    if (containsTranscriptSignal(haystack)) {
+      return true;
+    }
+
+    if (!['Document', 'Fetch', 'XHR', 'Other'].includes(responseRecord.resourceType)) {
+      return false;
+    }
+
+    return isTextLikeContent(haystack);
+  }
+
+  function summarizeWebSocketPayload(payloadData) {
+    const payloadText = String(payloadData || '');
+    const jsonValue = tryParseJson(payloadText);
+
+    return {
+      payloadLength: payloadText.length,
+      payloadPreview: trimForPreview(
+        payloadText,
+        MAX_DEBUG_FRAME_PREVIEW_LENGTH,
+      ),
+      jsonPreview:
+        jsonValue == null
+          ? ''
+          : trimForPreview(
+              JSON.stringify(jsonValue),
+              MAX_DEBUG_FRAME_PREVIEW_LENGTH,
+            ),
+      transcriptSignalDetected: containsTranscriptSignal(payloadText),
+    };
+  }
+
+  function formatTimestampValue(value) {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      if (value >= 86_400) {
+        return String(value);
+      }
+
+      const wholeSeconds = Math.max(0, Math.floor(value));
+      const hours = Math.floor(wholeSeconds / 3600);
+      const minutes = Math.floor((wholeSeconds % 3600) / 60);
+      const seconds = wholeSeconds % 60;
+
+      if (hours > 0) {
+        return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+      }
+
+      return `${minutes}:${String(seconds).padStart(2, '0')}`;
+    }
+
+    const text = normalizeInlineText(value);
+    if (!text) {
+      return '';
+    }
+
+    return text;
+  }
+
+  function stripHtmlTags(value) {
+    return String(value || '')
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/&amp;/gi, '&')
+      .replace(/&lt;/gi, '<')
+      .replace(/&gt;/gi, '>');
+  }
+
+  function shouldTrackNetworkResponse(response, resourceType) {
+    const url = String(response?.url || '').toLowerCase();
+    if (url.startsWith('data:')) {
+      return false;
+    }
+
+    const mimeType = String(response?.mimeType || '').toLowerCase();
+    const headers = lowerCaseHeaderMap(response?.headers);
+    const contentType = String(headers['content-type'] || '').toLowerCase();
+    const contentDisposition = String(headers['content-disposition'] || '').toLowerCase();
+    const score = scoreNetworkResponse({
+      url,
+      mimeType,
+      contentType,
+      contentDisposition,
+      resourceType,
+    });
+
+    if (score >= 3) {
+      return true;
+    }
+
+    if (!['Fetch', 'XHR'].includes(resourceType)) {
+      return false;
+    }
+
+    return /json|text|vtt|plain|javascript/.test(`${mimeType} ${contentType}`);
+  }
+
+  function scoreNetworkResponse({
+    url,
+    mimeType,
+    contentType,
+    contentDisposition,
+    resourceType,
+  }) {
+    if (String(url || '').startsWith('data:')) {
+      return 0;
+    }
+
+    let score = 0;
+    const haystack = [url, mimeType, contentType, contentDisposition].join(' ');
+
+    if (['Fetch', 'XHR'].includes(resourceType)) {
+      score += 2;
+    }
+
+    if (/transcript|caption|subtitle|subtitles|vtt|utterance|speaker|speech/.test(haystack)) {
+      score += 4;
+    }
+
+    if (/json|text|vtt|plain|javascript/.test(haystack)) {
+      score += 2;
+    }
+
+    if (/stream|microsoftstream|api/.test(url)) {
+      score += 1;
+    }
+
+    return score;
   }
 
   function isDataUrl(url) {
@@ -3814,203 +3733,6 @@ const runEmbeddedNetworkMode = (() => {
       String(resourceType || '').toLowerCase(),
     ].join(' ');
   }
-  
-  function containsTranscriptSignal(value) {
-    return /transcript|caption|subtitle|subtitles|utterance|speaker|speech|vtt|closedcaption/.test(
-      String(value || '').toLowerCase(),
-    );
-  }
-  
-  function shouldTrackDebugTraffic({
-    url,
-    resourceType,
-    method = '',
-    headers = {},
-    postData = '',
-    captureAll = false,
-  }) {
-    if (captureAll) {
-      return true;
-    }
-  
-    const lowerHeaders = lowerCaseHeaderMap(headers);
-    const haystack = [
-      url,
-      resourceType,
-      method,
-      lowerHeaders['content-type'] || '',
-      lowerHeaders.accept || '',
-      trimForPreview(postData, 400),
-    ]
-      .join(' ')
-      .toLowerCase();
-  
-    if (containsTranscriptSignal(haystack)) {
-      return true;
-    }
-  
-    if (!isStreamRelatedUrl(url)) {
-      return false;
-    }
-  
-    return [
-      'Document',
-      'Fetch',
-      'XHR',
-      'WebSocket',
-      'EventSource',
-      'Other',
-      'Preflight',
-    ].includes(String(resourceType || ''));
-  }
-  
-  function shouldFetchDebugResponseBody(responseRecord) {
-    if (!responseRecord || !responseRecord.finished || responseRecord.loadingFailure) {
-      return false;
-    }
-  
-    const haystack = [
-      responseRecord.url,
-      responseRecord.mimeType,
-      responseRecord.contentType,
-    ].join(' ');
-  
-    if (containsTranscriptSignal(haystack)) {
-      return true;
-    }
-  
-    if (!['Document', 'Fetch', 'XHR', 'Other'].includes(responseRecord.resourceType)) {
-      return false;
-    }
-  
-    return isTextLikeContent(haystack);
-  }
-  
-  function summarizeWebSocketPayload(payloadData) {
-    const payloadText = String(payloadData || '');
-    const jsonValue = tryParseJson(payloadText);
-  
-    return {
-      payloadLength: payloadText.length,
-      payloadPreview: trimForPreview(
-        payloadText,
-        MAX_DEBUG_FRAME_PREVIEW_LENGTH,
-      ),
-      jsonPreview:
-        jsonValue == null
-          ? ''
-          : trimForPreview(
-              JSON.stringify(jsonValue),
-              MAX_DEBUG_FRAME_PREVIEW_LENGTH,
-            ),
-      transcriptSignalDetected: containsTranscriptSignal(payloadText),
-    };
-  }
-  
-  function formatTimestampValue(value) {
-    if (typeof value === 'number' && Number.isFinite(value)) {
-      if (value >= 86_400) {
-        return String(value);
-      }
-  
-      const wholeSeconds = Math.max(0, Math.floor(value));
-      const hours = Math.floor(wholeSeconds / 3600);
-      const minutes = Math.floor((wholeSeconds % 3600) / 60);
-      const seconds = wholeSeconds % 60;
-  
-      if (hours > 0) {
-        return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
-      }
-  
-      return `${minutes}:${String(seconds).padStart(2, '0')}`;
-    }
-  
-    const text = normalizeInlineText(value);
-    if (!text) {
-      return '';
-    }
-  
-    return text;
-  }
-  
-  function stripHtmlTags(value) {
-    return String(value || '')
-      .replace(/<br\s*\/?>/gi, '\n')
-      .replace(/<[^>]+>/g, ' ')
-      .replace(/&nbsp;/gi, ' ')
-      .replace(/&amp;/gi, '&')
-      .replace(/&lt;/gi, '<')
-      .replace(/&gt;/gi, '>');
-  }
-  
-  function shouldTrackNetworkResponse(response, resourceType) {
-    const url = String(response?.url || '').toLowerCase();
-    const mimeType = String(response?.mimeType || '').toLowerCase();
-    const headers = lowerCaseHeaderMap(response?.headers);
-    const contentType = String(headers['content-type'] || '').toLowerCase();
-    const contentDisposition = String(headers['content-disposition'] || '').toLowerCase();
-
-    if (isDataUrl(url) || isStaticAssetResourceType(resourceType)) {
-      return false;
-    }
-
-    const score = scoreNetworkResponse({
-      url,
-      mimeType,
-      contentType,
-      contentDisposition,
-      resourceType,
-    });
-  
-    if (score >= 3) {
-      return true;
-    }
-  
-    if (!['Fetch', 'XHR'].includes(resourceType)) {
-      return false;
-    }
-  
-    return /json|text|vtt|plain|javascript/.test(`${mimeType} ${contentType}`);
-  }
-  
-  function scoreNetworkResponse({
-    url,
-    mimeType,
-    contentType,
-    contentDisposition,
-    resourceType,
-  }) {
-    let score = 0;
-    const haystack = buildNetworkSignalHaystack({
-      url,
-      mimeType,
-      contentType,
-      contentDisposition,
-      resourceType,
-    });
-
-    if (isDataUrl(url) || isStaticAssetResourceType(resourceType)) {
-      return 0;
-    }
-  
-    if (['Fetch', 'XHR'].includes(resourceType)) {
-      score += 2;
-    }
-  
-    if (/transcript|caption|subtitle|subtitles|vtt|utterance|speaker|speech/.test(haystack)) {
-      score += 4;
-    }
-  
-    if (/json|text|vtt|plain|javascript/.test(haystack)) {
-      score += 2;
-    }
-  
-    if (/stream|microsoftstream|api/.test(url)) {
-      score += 1;
-    }
-  
-    return score;
-  }
 
   function isLikelyTranscriptResponseSignal({
     url,
@@ -4037,63 +3759,6 @@ const runEmbeddedNetworkMode = (() => {
     );
   }
 
-  function compareTrackedResponsePriority(left, right) {
-    const leftScore = Number(left?.score || 0);
-    const rightScore = Number(right?.score || 0);
-    if (leftScore !== rightScore) {
-      return leftScore - rightScore;
-    }
-
-    const leftFetchLike = ['Fetch', 'XHR'].includes(String(left?.resourceType || ''))
-      ? 1
-      : 0;
-    const rightFetchLike = ['Fetch', 'XHR'].includes(String(right?.resourceType || ''))
-      ? 1
-      : 0;
-    if (leftFetchLike !== rightFetchLike) {
-      return leftFetchLike - rightFetchLike;
-    }
-
-    return String(left?.url || '').length - String(right?.url || '').length;
-  }
-
-  function retainTrackedResponse(trackedResponses, responseRecord, maxTrackedResponses) {
-    if (trackedResponses.has(responseRecord.requestId)) {
-      trackedResponses.set(responseRecord.requestId, responseRecord);
-      return true;
-    }
-
-    if (trackedResponses.size < maxTrackedResponses) {
-      trackedResponses.set(responseRecord.requestId, responseRecord);
-      return true;
-    }
-
-    let lowestPriorityEntry = null;
-
-    for (const [requestId, candidate] of trackedResponses.entries()) {
-      if (
-        !lowestPriorityEntry ||
-        compareTrackedResponsePriority(candidate, lowestPriorityEntry.record) < 0
-      ) {
-        lowestPriorityEntry = {
-          requestId,
-          record: candidate,
-        };
-      }
-    }
-
-    if (
-      !lowestPriorityEntry ||
-      compareTrackedResponsePriority(responseRecord, lowestPriorityEntry.record) <= 0
-    ) {
-      return false;
-    }
-
-    trackedResponses.delete(lowestPriorityEntry.requestId);
-    trackedResponses.set(responseRecord.requestId, responseRecord);
-    return true;
-  }
-
   function formatNetworkResponseForTerminal({
     url,
     resourceType,
@@ -4115,7 +3780,7 @@ const runEmbeddedNetworkMode = (() => {
     const preview = trimForPreview(displayUrl, 140);
     return typeLabel ? `${preview} [${typeLabel}]` : preview;
   }
-  
+
   function tryParseJson(value) {
     try {
       return JSON.parse(value);
@@ -4123,69 +3788,69 @@ const runEmbeddedNetworkMode = (() => {
       return null;
     }
   }
-  
+
   function extractLeadingJsonText(value) {
     const text = stripUtf8Bom(String(value || '')).trimStart();
     if (!text || !['{', '['].includes(text[0])) {
       return '';
     }
-  
+
     const stack = [text[0]];
     let inString = false;
     let isEscaped = false;
-  
+
     for (let index = 1; index < text.length; index += 1) {
       const char = text[index];
-  
+
       if (inString) {
         if (isEscaped) {
           isEscaped = false;
           continue;
         }
-  
+
         if (char === '\\') {
           isEscaped = true;
           continue;
         }
-  
+
         if (char === '"') {
           inString = false;
         }
         continue;
       }
-  
+
       if (char === '"') {
         inString = true;
         continue;
       }
-  
+
       if (char === '{' || char === '[') {
         stack.push(char);
         continue;
       }
-  
+
       if (char === '}' || char === ']') {
         const expected = char === '}' ? '{' : '[';
         if (stack[stack.length - 1] !== expected) {
           return '';
         }
-  
+
         stack.pop();
         if (stack.length === 0) {
           return text.slice(0, index + 1);
         }
       }
     }
-  
+
     return '';
   }
-  
+
   function tryParseJsonLenient(value) {
     const direct = tryParseJson(value);
     if (direct != null) {
       return direct;
     }
-  
+
     const leadingJson = extractLeadingJsonText(value);
     if (leadingJson) {
       const extracted = tryParseJson(leadingJson);
@@ -4193,47 +3858,47 @@ const runEmbeddedNetworkMode = (() => {
         return extracted;
       }
     }
-  
+
     const text = String(value || '');
     if (!text.includes('\\\\')) {
       return null;
     }
-  
+
     return tryParseJson(text.replace(/\\\\/g, '\\'));
   }
-  
+
   function extractDisplayDate(value) {
     const text = normalizeText(value);
     if (!text) {
       return '';
     }
-  
+
     const monthDateMatch = text.match(
       /\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}\b/i,
     );
     if (monthDateMatch) {
       return normalizeInlineText(monthDateMatch[0]);
     }
-  
+
     const isoDateMatch = text.match(/\b\d{4}-\d{2}-\d{2}\b/);
     if (isoDateMatch) {
       return normalizeInlineText(isoDateMatch[0]);
     }
-  
+
     return '';
   }
-  
+
   function formatIsoDateForDisplay(value) {
     const text = normalizeInlineText(value);
     if (!text) {
       return '';
     }
-  
+
     const date = new Date(text);
     if (Number.isNaN(date.getTime())) {
       return '';
     }
-  
+
     return new Intl.DateTimeFormat('en-US', {
       month: 'long',
       day: 'numeric',
@@ -4241,18 +3906,18 @@ const runEmbeddedNetworkMode = (() => {
       timeZone: 'UTC',
     }).format(date);
   }
-  
+
   function formatIsoDateTimeForDisplay(value) {
     const text = normalizeInlineText(value);
     if (!text) {
       return '';
     }
-  
+
     const date = new Date(text);
     if (Number.isNaN(date.getTime())) {
       return text;
     }
-  
+
     return new Intl.DateTimeFormat('en-US', {
       month: 'long',
       day: 'numeric',
@@ -4265,36 +3930,36 @@ const runEmbeddedNetworkMode = (() => {
       timeZoneName: 'short',
     }).format(date);
   }
-  
+
   function parseSharePointLookupValue(value) {
     const fields = {};
-  
+
     for (const line of String(value || '').split(/\r?\n/)) {
       const separatorIndex = line.indexOf('|');
       const typeIndex = line.indexOf(':');
       if (separatorIndex <= 0 || typeIndex <= 0 || typeIndex > separatorIndex) {
         continue;
       }
-  
+
       const key = line.slice(0, typeIndex).trim();
       const fieldValue = line.slice(separatorIndex + 1);
       if (!key || !fieldValue) {
         continue;
       }
-  
+
       fields[key] = fieldValue;
     }
-  
+
     return fields;
   }
-  
+
   function extractUsersFromActivity(value) {
     const activity = tryParseJsonLenient(value);
     const users = activity?.FileActivityUsersOnPage;
     if (!Array.isArray(users)) {
       return [];
     }
-  
+
     return users
       .map((user) => ({
         displayName: normalizeInlineText(user?.DisplayName || user?.displayName || ''),
@@ -4302,27 +3967,27 @@ const runEmbeddedNetworkMode = (() => {
       }))
       .filter((user) => user.displayName || user.id);
   }
-  
+
   function findDisplayNameForEmail(users, email) {
     const normalizedEmail = normalizeInlineText(email).toLowerCase();
     if (!normalizedEmail) {
       return '';
     }
-  
+
     const matchedUser = users.find(
       (user) => normalizeInlineText(user.id).toLowerCase() === normalizedEmail,
     );
-  
+
     return matchedUser?.displayName || '';
   }
-  
+
   function extractStreamMeetingMetadataFromBody(bodyText) {
     const jsonValue = tryParseJsonLenient(bodyText);
     const rows = jsonValue?.ListData?.Row;
     if (!Array.isArray(rows) || rows.length === 0) {
       return null;
     }
-  
+
     for (const row of rows) {
       const metaInfoValues = Array.isArray(row?.MetaInfo)
         ? row.MetaInfo
@@ -4333,7 +3998,7 @@ const runEmbeddedNetworkMode = (() => {
         : typeof row?.MetaInfo === 'string'
           ? [row.MetaInfo]
           : [];
-  
+
       const lookupValue = metaInfoValues.find(
         (value) =>
           String(value).includes('vti_stream_tmr_organizerupn:') ||
@@ -4343,14 +4008,14 @@ const runEmbeddedNetworkMode = (() => {
       if (!lookupValue) {
         continue;
       }
-  
+
       const fields = parseSharePointLookupValue(lookupValue);
       const mediaItemMetadata = tryParseJsonLenient(
         fields.vti_stream_mediaitemmetadata || '',
       );
       const organizerEmail = normalizeInlineText(fields.vti_stream_tmr_organizerupn || '');
       const activityUsers = extractUsersFromActivity(row?._activity || row?.Activity || '');
-  
+
       return {
         title: normalizeInlineText(fields.vti_title || row?.FileLeafRef || ''),
         date: formatIsoDateForDisplay(mediaItemMetadata?.recordingStartDateTime || ''),
@@ -4372,38 +4037,38 @@ const runEmbeddedNetworkMode = (() => {
         sharePointItemUrl: normalizeInlineText(row?.['.spItemUrl'] || ''),
       };
     }
-  
+
     return null;
   }
-  
+
   function extractMeetingMetadataFromCapture(captureResult) {
     const bodySources = [];
-  
+
     for (const candidate of captureResult?.candidates || []) {
       bodySources.push({
         url: candidate.url,
         body: candidate.body,
       });
     }
-  
+
     for (const responseBody of captureResult?.debug?.responseBodies || []) {
       bodySources.push({
         url: responseBody.url,
         body: responseBody.body,
       });
     }
-  
+
     for (const bodySource of bodySources) {
       if (!bodySource?.body || !isStreamRelatedUrl(bodySource.url)) {
         continue;
       }
-  
+
       const metadata = extractStreamMeetingMetadataFromBody(bodySource.body);
       if (metadata) {
         return metadata;
       }
     }
-  
+
     return {
       title: '',
       date: '',
@@ -4419,7 +4084,7 @@ const runEmbeddedNetworkMode = (() => {
       sharePointItemUrl: '',
     };
   }
-  
+
   function mergeMeetingMetadata(pageMetadata, captureMetadata, targetPage) {
     return {
       title:
@@ -4476,27 +4141,27 @@ const runEmbeddedNetworkMode = (() => {
         '',
     };
   }
-  
+
   function vttTimestampToDisplay(value) {
     const match = String(value || '').trim().match(
       /^(?:(\d{2,}):)?(\d{2}):(\d{2})(?:\.(\d{1,3}))?$/,
     );
-  
+
     if (!match) {
       return normalizeInlineText(value);
     }
-  
+
     const hours = Number(match[1] || 0);
     const minutes = Number(match[2] || 0);
     const seconds = Number(match[3] || 0);
-  
+
     if (hours > 0) {
       return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
     }
-  
+
     return `${minutes}:${String(seconds).padStart(2, '0')}`;
   }
-  
+
   /**
    * @param {string} bodyText
    * @returns {TranscriptEntry[]}
@@ -4506,36 +4171,36 @@ const runEmbeddedNetworkMode = (() => {
     if (!trimmed.startsWith('WEBVTT')) {
       return [];
     }
-  
+
     const blocks = trimmed.split(/\n{2,}/);
     const entries = [];
-  
+
     for (const rawBlock of blocks) {
       const lines = rawBlock
         .split(/\r?\n/)
         .map((line) => line.trim())
         .filter(Boolean);
-  
+
       if (lines.length === 0 || lines[0] === 'WEBVTT' || lines[0].startsWith('NOTE')) {
         continue;
       }
-  
+
       let cursor = 0;
       if (!lines[cursor].includes('-->') && lines[cursor + 1]?.includes('-->')) {
         cursor += 1;
       }
-  
+
       const timingLine = lines[cursor];
       if (!timingLine || !timingLine.includes('-->')) {
         continue;
       }
-  
+
       const [startTime] = timingLine.split(/\s+-->\s+/, 2);
       const textLines = lines.slice(cursor + 1);
       if (textLines.length === 0) {
         continue;
       }
-  
+
       let speaker = '';
       const normalizedLines = textLines.map((line) => {
         const speakerTagMatch = line.match(/<v(?:\.[^>]*)?\s+([^>]+)>(.*)$/i);
@@ -4543,10 +4208,10 @@ const runEmbeddedNetworkMode = (() => {
           speaker = normalizeInlineText(stripHtmlTags(speakerTagMatch[1]));
           return speakerTagMatch[2];
         }
-  
+
         return line;
       });
-  
+
       let text = normalizeInlineText(stripHtmlTags(normalizedLines.join(' ')));
       if (!speaker) {
         const speakerPrefixMatch = text.match(/^([^:]{2,80}):\s+(.*)$/);
@@ -4555,70 +4220,70 @@ const runEmbeddedNetworkMode = (() => {
           text = normalizeInlineText(speakerPrefixMatch[2]);
         }
       }
-  
+
       if (!text) {
         continue;
       }
-  
+
       entries.push({
         speaker,
         timestamp: vttTimestampToDisplay(startTime),
         text,
       });
     }
-  
+
     return entries;
   }
-  
+
   function getFirstStringValue(target, keyPaths) {
     for (const path of keyPaths) {
       const parts = path.split('.');
       let current = target;
-  
+
       for (const part of parts) {
         if (current == null || typeof current !== 'object' || !(part in current)) {
           current = undefined;
           break;
         }
-  
+
         current = current[part];
       }
-  
+
       if (typeof current === 'string' && normalizeInlineText(current)) {
         return current;
       }
     }
-  
+
     return '';
   }
-  
+
   function getFirstNumberValue(target, keyPaths) {
     for (const path of keyPaths) {
       const parts = path.split('.');
       let current = target;
-  
+
       for (const part of parts) {
         if (current == null || typeof current !== 'object' || !(part in current)) {
           current = undefined;
           break;
         }
-  
+
         current = current[part];
       }
-  
+
       if (typeof current === 'number' && Number.isFinite(current)) {
         return current;
       }
     }
-  
+
     return null;
   }
-  
+
   function extractEntryFromObject(value) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       return null;
     }
-  
+
     const speaker = getFirstStringValue(value, [
       'speaker',
       'speakerName',
@@ -4632,7 +4297,7 @@ const runEmbeddedNetworkMode = (() => {
       'identity.displayName',
       'from.user.displayName',
     ]);
-  
+
     const text = getFirstStringValue(value, [
       'text',
       'displayText',
@@ -4644,11 +4309,11 @@ const runEmbeddedNetworkMode = (() => {
       'body',
       'cueText',
     ]);
-  
+
     if (!normalizeInlineText(text)) {
       return null;
     }
-  
+
     const numericTimestamp = getFirstNumberValue(value, [
       'start',
       'startTime',
@@ -4666,7 +4331,7 @@ const runEmbeddedNetworkMode = (() => {
       'startOffset',
       'endOffset',
     ]);
-  
+
     return {
       speaker: normalizeInlineText(speaker),
       timestamp: formatTimestampValue(
@@ -4675,7 +4340,7 @@ const runEmbeddedNetworkMode = (() => {
       text: normalizeInlineText(stripHtmlTags(text)),
     };
   }
-  
+
   function extractEntriesFromJson(value) {
     if (
       value &&
@@ -4686,7 +4351,7 @@ const runEmbeddedNetworkMode = (() => {
       const topLevelEntries = value.entries
         .map((item) => extractEntryFromObject(item))
         .filter((entry) => entry && entry.text);
-  
+
       if (topLevelEntries.length > 0) {
         return {
           path: '$.entries',
@@ -4699,51 +4364,51 @@ const runEmbeddedNetworkMode = (() => {
         };
       }
     }
-  
+
     const matches = [];
-  
+
     function walk(current, path, depth = 0) {
       if (depth > 10 || current == null) {
         return;
       }
-  
+
       if (Array.isArray(current)) {
         const entries = current
           .map((item) => extractEntryFromObject(item))
           .filter((entry) => entry && entry.text);
-  
+
         if (entries.length > 0) {
           const pathText = path.toLowerCase();
           let score = entries.length * 3;
           score += entries.filter((entry) => entry.speaker).length * 2;
           score += entries.filter((entry) => entry.timestamp).length;
-  
+
           if (/transcript|caption|subtitle|utterance|cue/.test(pathText)) {
             score += 10;
           }
-  
+
           matches.push({
             path,
             entries,
             score,
           });
         }
-  
+
         current.forEach((item, index) => {
           walk(item, `${path}[${index}]`, depth + 1);
         });
         return;
       }
-  
+
       if (typeof current !== 'object') {
         return;
       }
-  
+
       for (const [key, child] of Object.entries(current)) {
         walk(child, `${path}.${key}`, depth + 1);
       }
     }
-  
+
     walk(value, '$');
     matches.sort((left, right) => right.score - left.score);
     return matches[0] || {
@@ -4752,7 +4417,7 @@ const runEmbeddedNetworkMode = (() => {
       score: 0,
     };
   }
-  
+
   function extractProtectionKeyFromLookupValue(value, sourceUrl = '') {
     const protectionLine = String(value || '')
       .split(/\r?\n/)
@@ -4760,47 +4425,47 @@ const runEmbeddedNetworkMode = (() => {
     if (!protectionLine) {
       return null;
     }
-  
+
     const jsonStart = protectionLine.indexOf('|{');
     if (jsonStart < 0) {
       return null;
     }
-  
+
     const protectionEnvelope = tryParseJsonLenient(
       protectionLine.slice(jsonStart + 1),
     );
     if (!protectionEnvelope || typeof protectionEnvelope !== 'object') {
       return null;
     }
-  
+
     const protectionData = tryParseJsonLenient(
       String(protectionEnvelope.ProtectionKeyData || ''),
     );
     if (!protectionData || typeof protectionData !== 'object') {
       return null;
     }
-  
+
     const keyBase64 = String(protectionData.Key || '');
     const ivBase64 = String(protectionData.IV || '');
     let keyBytes;
     let ivBytes;
-  
+
     try {
       keyBytes = Buffer.from(keyBase64, 'base64');
       ivBytes = Buffer.from(ivBase64, 'base64');
     } catch {
       return null;
     }
-  
+
     if (keyBytes.length !== 16 || ivBytes.length !== 16) {
       return null;
     }
-  
+
     const kid = String(protectionData.Kid || protectionEnvelope.keyId || '').trim();
     if (!kid) {
       return null;
     }
-  
+
     return {
       kid,
       sourceUrl,
@@ -4821,20 +4486,20 @@ const runEmbeddedNetworkMode = (() => {
       ivBase64,
     };
   }
-  
+
   function collectProtectionKeysFromBody(bodyText, sourceUrl = '') {
     const jsonValue = tryParseJson(bodyText);
     if (jsonValue == null) {
       return [];
     }
-  
+
     const matches = [];
-  
+
     function walk(current, depth = 0) {
       if (current == null || depth > 12) {
         return;
       }
-  
+
       if (typeof current === 'string') {
         if (current.includes('vti_mediaserviceprotectionkey:SW|')) {
           const protectionKey = extractProtectionKeyFromLookupValue(
@@ -4847,31 +4512,31 @@ const runEmbeddedNetworkMode = (() => {
         }
         return;
       }
-  
+
       if (Array.isArray(current)) {
         current.forEach((item) => walk(item, depth + 1));
         return;
       }
-  
+
       if (typeof current !== 'object') {
         return;
       }
-  
+
       Object.values(current).forEach((child) => walk(child, depth + 1));
     }
-  
+
     walk(jsonValue);
     return matches;
   }
-  
+
   function buildProtectionKeyMap(bodySources) {
     const keysByKid = new Map();
-  
+
     for (const source of bodySources) {
       if (!source?.body) {
         continue;
       }
-  
+
       const matches = collectProtectionKeysFromBody(source.body, source.url || '');
       for (const match of matches) {
         if (!keysByKid.has(match.kid)) {
@@ -4879,10 +4544,10 @@ const runEmbeddedNetworkMode = (() => {
         }
       }
     }
-  
+
     return keysByKid;
   }
-  
+
   function getUrlSearchParam(url, paramName) {
     try {
       return new URL(url).searchParams.get(paramName) || '';
@@ -4890,11 +4555,11 @@ const runEmbeddedNetworkMode = (() => {
       return '';
     }
   }
-  
+
   function isEncryptedTranscriptUrl(url) {
     return /\/cdnmedia\/transcripts/i.test(String(url || ''));
   }
-  
+
   function decryptTranscriptBody(bodyRecord, protectionKey) {
     if (!bodyRecord?.rawBodyBase64) {
       return {
@@ -4904,7 +4569,7 @@ const runEmbeddedNetworkMode = (() => {
         decryptionError: '',
       };
     }
-  
+
     const encryptionAlgorithm = Number(protectionKey?.encryptionAlgorithm);
     const encryptionMode = Number(protectionKey?.encryptionMode);
     if (encryptionAlgorithm !== 0 || encryptionMode !== 1) {
@@ -4917,7 +4582,7 @@ const runEmbeddedNetworkMode = (() => {
           `${encryptionAlgorithm}/${encryptionMode}`,
       };
     }
-  
+
     try {
       const ciphertext = Buffer.from(bodyRecord.rawBodyBase64, 'base64');
       const decipher = createDecipheriv(
@@ -4925,11 +4590,11 @@ const runEmbeddedNetworkMode = (() => {
         Buffer.from(protectionKey.keyBase64, 'base64'),
         Buffer.from(protectionKey.ivBase64, 'base64'),
       );
-  
+
       if (String(protectionKey.padding || '').toLowerCase() === 'none') {
         decipher.setAutoPadding(false);
       }
-  
+
       const plaintext = Buffer.concat([
         decipher.update(ciphertext),
         decipher.final(),
@@ -4937,7 +4602,7 @@ const runEmbeddedNetworkMode = (() => {
       const decoded = stripUtf8Bom(
         plaintext.toString('utf8').replace(/\u0000+$/g, ''),
       );
-  
+
       return {
         body: decoded,
         decrypted: true,
@@ -4956,14 +4621,14 @@ const runEmbeddedNetworkMode = (() => {
       };
     }
   }
-  
+
   function finalizeBodyRecordForResponse(url, bodyRecord, protectionKeys) {
     const normalizedBody = stripUtf8Bom(bodyRecord?.body || '');
     let body = normalizedBody;
     let decrypted = false;
     let decryptionKeyId = '';
     let decryptionError = '';
-  
+
     if (isEncryptedTranscriptUrl(url)) {
       const keyId = getUrlSearchParam(url, 'kid');
       const protectionKey =
@@ -4971,7 +4636,7 @@ const runEmbeddedNetworkMode = (() => {
         (protectionKeys.size === 1
           ? Array.from(protectionKeys.values())[0]
           : null);
-  
+
       if (protectionKey) {
         const decryptedBody = decryptTranscriptBody(
           {
@@ -4986,7 +4651,7 @@ const runEmbeddedNetworkMode = (() => {
         decryptionError = decryptedBody.decryptionError;
       }
     }
-  
+
     return {
       ...bodyRecord,
       body,
@@ -4997,7 +4662,7 @@ const runEmbeddedNetworkMode = (() => {
       decryptionError,
     };
   }
-  
+
   function summarizeCapturedBody(bodyText) {
     const trimmed = stripUtf8Bom(String(bodyText || '')).trim();
     if (!trimmed) {
@@ -5008,7 +4673,7 @@ const runEmbeddedNetworkMode = (() => {
         entries: [],
       };
     }
-  
+
     const vttEntries = parseWebVttTranscript(trimmed);
     if (vttEntries.length > 0) {
       return {
@@ -5018,7 +4683,7 @@ const runEmbeddedNetworkMode = (() => {
         entries: vttEntries,
       };
     }
-  
+
     const jsonValue = tryParseJsonLenient(trimmed);
     if (jsonValue != null) {
       const jsonMatch = extractEntriesFromJson(jsonValue);
@@ -5029,7 +4694,7 @@ const runEmbeddedNetworkMode = (() => {
         entries: jsonMatch.entries,
       };
     }
-  
+
     return {
       format: '',
       path: '',
@@ -5037,7 +4702,79 @@ const runEmbeddedNetworkMode = (() => {
       entries: [],
     };
   }
-  
+
+  function isUsableTranscriptCandidate(candidate) {
+    const entryCount = Number(candidate?.parsedEntryCount || 0);
+    if (entryCount <= 0) {
+      return false;
+    }
+
+    const entries = Array.isArray(candidate?.parsedEntries)
+      ? candidate.parsedEntries
+      : [];
+    const speakerCount = entries.filter((entry) =>
+      normalizeInlineText(entry?.speaker || ''),
+    ).length;
+    const timestampCount = entries.filter((entry) =>
+      normalizeInlineText(entry?.timestamp || ''),
+    ).length;
+    const signalText = [
+      candidate?.url || '',
+      candidate?.mimeType || '',
+      candidate?.contentType || '',
+      candidate?.parsedPath || '',
+    ]
+      .join(' ')
+      .toLowerCase();
+
+    if (candidate?.parsedFormat === 'vtt' || isEncryptedTranscriptUrl(candidate?.url || '')) {
+      return true;
+    }
+
+    if (containsTranscriptSignal(signalText)) {
+      return speakerCount > 0 || timestampCount > 0 || entryCount >= 8;
+    }
+
+    return speakerCount >= 2 && timestampCount >= 1;
+  }
+
+  function scoreTranscriptCandidate(candidate) {
+    const entries = Array.isArray(candidate?.parsedEntries)
+      ? candidate.parsedEntries
+      : [];
+    const speakerCount = entries.filter((entry) =>
+      normalizeInlineText(entry?.speaker || ''),
+    ).length;
+    const timestampCount = entries.filter((entry) =>
+      normalizeInlineText(entry?.timestamp || ''),
+    ).length;
+    const signalText = [
+      candidate?.url || '',
+      candidate?.mimeType || '',
+      candidate?.contentType || '',
+      candidate?.parsedPath || '',
+    ]
+      .join(' ')
+      .toLowerCase();
+
+    let score = Number(candidate?.score || 0);
+    score += Number(candidate?.parsedEntryCount || 0) * 3;
+    score += speakerCount * 2;
+    score += timestampCount * 2;
+
+    if (containsTranscriptSignal(signalText)) {
+      score += 20;
+    }
+    if (candidate?.parsedFormat === 'vtt') {
+      score += 15;
+    }
+    if (isEncryptedTranscriptUrl(candidate?.url || '')) {
+      score += 15;
+    }
+
+    return score;
+  }
+
   async function extractMeetingMetadata(cdp) {
     return evaluate(
       cdp,
@@ -5053,7 +4790,7 @@ const runEmbeddedNetworkMode = (() => {
             ) ||
             allText.match(/(\\d{4}-\\d{2}-\\d{2}[\\s\\d:]*(?:UTC|GMT)?)/);
           const recordedByMatch = allText.match(/Recorded by\\s*\\n?\\s*(.+)/);
-  
+
           return {
             title,
             date: dateMatch?.[0]?.trim() || '',
@@ -5072,10 +4809,10 @@ const runEmbeddedNetworkMode = (() => {
       `,
     );
   }
-  
+
   function buildOutputPayload(metadata, entries) {
     const speakers = [...new Set(entries.map((entry) => entry.speaker).filter(Boolean))];
-  
+
     return {
       meeting: metadata,
       extractedAt: new Date().toISOString(),
@@ -5084,33 +4821,33 @@ const runEmbeddedNetworkMode = (() => {
       entries,
     };
   }
-  
+
   function sanitizeFilename(value) {
     const sanitized = value
       .replace(/[^a-zA-Z0-9-_ ]/g, '')
       .replace(/\s+/g, '_')
       .slice(0, 80);
-  
+
     return sanitized || 'meeting';
   }
-  
+
   function resolveOutputDirectory(outputDir) {
     return resolve(process.cwd(), outputDir || DEFAULT_OUTPUT_DIR);
   }
-  
+
   function buildOutputBasePath(defaultName, outputName, outputDir) {
     const absoluteOutputDir = resolveOutputDirectory(outputDir);
     mkdirSync(absoluteOutputDir, { recursive: true });
-  
+
     const timestamp = new Date()
       .toISOString()
       .replace(/[:.]/g, '-')
       .slice(0, 19);
-  
+
     const baseName = sanitizeFilename(outputName || defaultName || 'meeting');
     return join(absoluteOutputDir, `${baseName}_${timestamp}`);
   }
-  
+
   function buildMarkdownOutput(payload) {
     const createdByLabel = payload.meeting.createdByEmail
       ? payload.meeting.createdBy &&
@@ -5140,7 +4877,7 @@ const runEmbeddedNetworkMode = (() => {
       `Extracted at: ${payload.extractedAt}`,
       `Entry count: ${payload.entryCount}`,
     ].filter(Boolean);
-  
+
     const entryBlocks = payload.entries.map((entry) => {
       const speaker = entry.speaker || 'Unknown speaker';
       const timestamp = entry.timestamp || '';
@@ -5149,10 +4886,10 @@ const runEmbeddedNetworkMode = (() => {
         .replace(/\r\n/g, '\n')
         .replace(/\n{2,}/g, '\n')
         .trim();
-  
+
       return `${heading}\n${text}`;
     });
-  
+
     return [
       'Transcript information',
       '',
@@ -5164,149 +4901,525 @@ const runEmbeddedNetworkMode = (() => {
       '',
     ].join('\n');
   }
-  
+
   function saveOutputs(payload, outputBasePath, outputFormat) {
     const transcriptPaths = [];
-  
+
     if (outputFormat === 'json' || outputFormat === 'both') {
       const jsonPath = `${outputBasePath}.json`;
       writeFileSync(jsonPath, JSON.stringify(payload, null, 2));
       transcriptPaths.push(jsonPath);
     }
-  
+
     if (outputFormat === 'md' || outputFormat === 'both') {
       const markdownPath = `${outputBasePath}.md`;
       writeFileSync(markdownPath, buildMarkdownOutput(payload));
       transcriptPaths.push(markdownPath);
     }
-  
+
     return transcriptPaths;
   }
-  
+
   function saveNetworkCaptureOutput(payload, outputBasePath) {
     const outputPath = `${outputBasePath}.network.json`;
     writeFileSync(outputPath, JSON.stringify(payload, null, 2));
     return outputPath;
   }
-  
-  async function selectTranscriptPage(prompt, debugPort) {
-    const pages = await findPageTargets(debugPort);
-  
-    if (pages.length === 0) {
+
+  function saveBatchStatusOutput(payload, outputBasePath) {
+    const outputPath = `${outputBasePath}.batch.json`;
+    writeFileSync(outputPath, JSON.stringify(payload, null, 2));
+    return outputPath;
+  }
+
+  function resolveCrawlerStatePath(options) {
+    if (options.stateFile) {
+      return resolve(options.stateFile);
+    }
+
+    return `${buildOutputBasePath('crawl', options.outputName, options.outputDir)}.state.json`;
+  }
+
+  function saveCrawlerStateOutput(payload, stateFilePath) {
+    mkdirSync(dirname(stateFilePath), { recursive: true });
+    writeFileSync(stateFilePath, JSON.stringify(payload, null, 2));
+    return stateFilePath;
+  }
+
+  function saveCrawlerDiscoveryDebugOutput(payload, stateFilePath) {
+    const outputPath = stateFilePath.endsWith('.state.json')
+      ? stateFilePath.replace(/\.state\.json$/, '.discovery.debug.json')
+      : `${stateFilePath}.discovery.debug.json`;
+    mkdirSync(dirname(outputPath), { recursive: true });
+    writeFileSync(outputPath, JSON.stringify(payload, null, 2));
+    return outputPath;
+  }
+
+  function loadCrawlerState(stateFilePath) {
+    if (!existsSync(stateFilePath)) {
+      return {
+        stateVersion: CRAWL_STATE_VERSION,
+        items: [],
+      };
+    }
+
+    try {
+      const payload = JSON.parse(readFileSync(stateFilePath, 'utf-8'));
+      return {
+        stateVersion:
+          typeof payload?.stateVersion === 'number'
+            ? payload.stateVersion
+            : CRAWL_STATE_VERSION,
+        items: Array.isArray(payload?.items) ? payload.items : [],
+      };
+    } catch (error) {
       throw new CliError(
-        'No browser tabs were found. Open the Stream meeting, then try again.',
+        `Unable to read crawl state file "${stateFilePath}": ` +
+          `${error instanceof Error ? error.message : 'Unknown parse failure.'}`,
       );
     }
-  
+  }
+
+  function uniqueStrings(values) {
+    return [...new Set((values || []).map((value) => String(value || '').trim()).filter(Boolean))];
+  }
+
+  function getCrawlerItemProgress(item) {
+    if (item?.isNewThisRun && Number(item?.attemptCount || 0) === 0) {
+      return 'new';
+    }
+
+    const status = String(item?.lastStatus || '').toLowerCase();
+    if (status === 'success') {
+      return 'done';
+    }
+    if (status === 'failed') {
+      return 'failed';
+    }
+
+    return 'pending';
+  }
+
+  function getCrawlerItemLookupUrls(item) {
+    return uniqueNormalizedMeetingUrls([
+      item?.url || '',
+      ...(Array.isArray(item?.candidateUrls) ? item.candidateUrls : []),
+    ]);
+  }
+
+  function normalizeCrawlerStateItem(item, fallbackDiscoveredAt = '') {
+    const candidateUrls = sortMeetingUrlsForExtraction(
+      getCrawlerItemLookupUrls(item),
+    );
+    const url = candidateUrls[0] || normalizeMeetingUrl(item?.url);
+
+    return {
+      url,
+      identityKey: normalizeInlineText(item?.identityKey || ''),
+      title: String(item?.title || ''),
+      subtitle: String(item?.subtitle || ''),
+      candidateUrls,
+      sources: uniqueStrings(item?.sources),
+      discoveryPaths: uniqueStrings(item?.discoveryPaths),
+      discoverySourceUrls: uniqueStrings(item?.discoverySourceUrls),
+      firstDiscoveredAt: String(item?.firstDiscoveredAt || fallbackDiscoveredAt),
+      lastDiscoveredAt: String(
+        item?.lastDiscoveredAt || item?.firstDiscoveredAt || fallbackDiscoveredAt,
+      ),
+      discoveryCount: Number.isInteger(item?.discoveryCount) ? item.discoveryCount : 0,
+      lastStatus: String(item?.lastStatus || 'pending'),
+      attemptCount: Number.isInteger(item?.attemptCount) ? item.attemptCount : 0,
+      successCount: Number.isInteger(item?.successCount) ? item.successCount : 0,
+      failureCount: Number.isInteger(item?.failureCount) ? item.failureCount : 0,
+      lastSelectedAt: String(item?.lastSelectedAt || ''),
+      lastAttemptedAt: String(item?.lastAttemptedAt || ''),
+      lastSucceededAt: String(item?.lastSucceededAt || ''),
+      lastFailedAt: String(item?.lastFailedAt || ''),
+      lastError: String(item?.lastError || ''),
+      lastEntryCount: Number.isInteger(item?.lastEntryCount) ? item.lastEntryCount : 0,
+      lastMatchedCandidateUrl: String(item?.lastMatchedCandidateUrl || ''),
+      outputPaths: Array.isArray(item?.outputPaths) ? item.outputPaths.map(String) : [],
+      networkOutputPath: String(item?.networkOutputPath || ''),
+      isNewThisRun: Boolean(item?.isNewThisRun),
+      seenInCurrentDiscovery: Boolean(item?.seenInCurrentDiscovery),
+    };
+  }
+
+  function mergeCrawlerStateItems(existingItems, discoveredItems, discoveredAt) {
+    const existingByUrl = new Map();
+    const existingByIdentityKey = new Map();
+    const normalizedExistingItems = [];
+
+    for (const item of existingItems) {
+      const normalized = normalizeCrawlerStateItem(item);
+      if (!normalized.url) {
+        continue;
+      }
+
+      normalized.isNewThisRun = false;
+      normalized.seenInCurrentDiscovery = false;
+      normalizedExistingItems.push(normalized);
+
+      for (const lookupUrl of getCrawlerItemLookupUrls(normalized)) {
+        if (!existingByUrl.has(lookupUrl)) {
+          existingByUrl.set(lookupUrl, normalized);
+        }
+      }
+
+      if (normalized.identityKey && !existingByIdentityKey.has(normalized.identityKey)) {
+        existingByIdentityKey.set(normalized.identityKey, normalized);
+      }
+    }
+
+    const mergedItems = [];
+    const matchedExistingItems = new Set();
+    const seenDiscoveryKeys = new Set();
+
+    for (const discoveryItem of discoveredItems) {
+      const identityKey = normalizeInlineText(discoveryItem?.identityKey || '');
+      const discoveryLookupUrls = getCrawlerItemLookupUrls(discoveryItem);
+      const discoveryKey = identityKey || discoveryLookupUrls[0] || '';
+      if (!discoveryKey || seenDiscoveryKeys.has(discoveryKey)) {
+        continue;
+      }
+      seenDiscoveryKeys.add(discoveryKey);
+
+      let existingItem = identityKey
+        ? existingByIdentityKey.get(identityKey) || null
+        : null;
+      if (!existingItem) {
+        for (const lookupUrl of discoveryLookupUrls) {
+          existingItem = existingByUrl.get(lookupUrl) || null;
+          if (existingItem) {
+            break;
+          }
+        }
+      }
+
+      if (existingItem) {
+        matchedExistingItems.add(existingItem);
+      }
+
+      const mergedItem = normalizeCrawlerStateItem(
+        {
+          ...existingItem,
+          ...discoveryItem,
+          identityKey: identityKey || existingItem?.identityKey || '',
+          title: discoveryItem?.title || existingItem?.title || '',
+          subtitle: discoveryItem?.subtitle || existingItem?.subtitle || '',
+          candidateUrls: sortMeetingUrlsForExtraction([
+            ...(existingItem?.candidateUrls || []),
+            ...discoveryLookupUrls,
+          ]),
+          sources: uniqueStrings([
+            ...(existingItem?.sources || []),
+            ...(discoveryItem?.sources || []),
+          ]),
+          discoveryPaths: uniqueStrings([
+            ...(existingItem?.discoveryPaths || []),
+            ...(discoveryItem?.discoveryPaths || []),
+          ]),
+          discoverySourceUrls: uniqueStrings([
+            ...(existingItem?.discoverySourceUrls || []),
+            ...(discoveryItem?.discoverySourceUrls || []),
+          ]),
+          firstDiscoveredAt: existingItem?.firstDiscoveredAt || discoveredAt,
+          lastDiscoveredAt: discoveredAt,
+          discoveryCount: Math.max(0, Number(existingItem?.discoveryCount || 0)) + 1,
+          lastStatus: existingItem?.lastStatus || 'pending',
+          isNewThisRun: !existingItem,
+          seenInCurrentDiscovery: true,
+        },
+        discoveredAt,
+      );
+
+      mergedItems.push(mergedItem);
+    }
+
+    for (const item of normalizedExistingItems) {
+      if (matchedExistingItems.has(item)) {
+        continue;
+      }
+
+      mergedItems.push({
+        ...item,
+        isNewThisRun: false,
+        seenInCurrentDiscovery: false,
+      });
+    }
+
+    return mergedItems;
+  }
+
+  function buildCrawlerStateSummary(items) {
+    const summary = {
+      totalItemCount: items.length,
+      seenInCurrentDiscoveryCount: 0,
+      newItemCount: 0,
+      pendingItemCount: 0,
+      failedItemCount: 0,
+      successItemCount: 0,
+    };
+
+    for (const item of items) {
+      const progress = getCrawlerItemProgress(item);
+      if (item?.seenInCurrentDiscovery) {
+        summary.seenInCurrentDiscoveryCount += 1;
+      }
+
+      if (progress === 'new') {
+        summary.newItemCount += 1;
+      } else if (progress === 'failed') {
+        summary.failedItemCount += 1;
+      } else if (progress === 'done') {
+        summary.successItemCount += 1;
+      } else {
+        summary.pendingItemCount += 1;
+      }
+    }
+
+    return summary;
+  }
+
+  function buildCrawlerStatePayload({
+    options,
+    browser,
+    profile,
+    stateFilePath,
+    items,
+    updatedAt,
+  }) {
+    return {
+      app: {
+        name: 'Stream Transcript Extractor',
+        version: BUILD_VERSION,
+        buildTime: BUILD_TIME,
+        platform: CURRENT_PLATFORM,
+      },
+      stateVersion: CRAWL_STATE_VERSION,
+      updatedAt,
+      stateFilePath,
+      options: {
+        startUrl: options.startUrl,
+        outputDir: resolveOutputDirectory(options.outputDir),
+        outputFormat: options.outputFormat,
+        debug: options.debug,
+      },
+      browser: browser
+        ? {
+            key: browser.key,
+            name: browser.name,
+          }
+        : null,
+      profile: profile
+        ? {
+            dirName: profile.dirName,
+            displayName: profile.displayName,
+            email: profile.email,
+          }
+        : null,
+      summary: buildCrawlerStateSummary(items),
+      items: items.map((item) => {
+        const normalizedItem = normalizeCrawlerStateItem(item);
+        return {
+          ...normalizedItem,
+          isNewThisRun: undefined,
+          seenInCurrentDiscovery: undefined,
+        };
+      }),
+    };
+  }
+
+  function isClearlyWrongMeetingLandingPage(pageSnapshot, expectedUrl = '') {
+    const title = String(pageSnapshot?.title || '').trim().toLowerCase();
+    const url = normalizeMeetingUrl(pageSnapshot?.url || '').toLowerCase();
+    const bodyTextPreview = String(pageSnapshot?.bodyTextPreview || '')
+      .trim()
+      .toLowerCase();
+    const expectedNormalizedUrl = normalizeMeetingUrl(expectedUrl).toLowerCase();
+
+    if (!url) {
+      return true;
+    }
+
+    if (/login\.microsoftonline\.com/.test(url) || title === 'sign in to your account') {
+      return true;
+    }
+
+    if (
+      url === DEFAULT_CRAWL_START_URL.toLowerCase() ||
+      /\/launch\/stream\/\?auth=2&home=1(?:&|$)/.test(url)
+    ) {
+      if (/m365 copilot|stream \| m365 copilot/.test(title)) {
+        return true;
+      }
+    }
+
+    if (
+      expectedNormalizedUrl &&
+      /meetingcatchupportal|meetingcatchup/.test(expectedNormalizedUrl) &&
+      url !== expectedNormalizedUrl &&
+      /m365\.cloud\.microsoft/.test(url)
+    ) {
+      return true;
+    }
+
+    if (
+      /organizational policy requires you to sign in again|forgot my password/.test(
+        bodyTextPreview,
+      )
+    ) {
+      return true;
+    }
+
+    return false;
+  }
+
+  async function getCurrentPageSnapshot(cdp) {
+    return evaluate(
+      cdp,
+      `
+        (() => ({
+          title: document.title.replace(' - Microsoft Stream', '').trim(),
+          url: location.href,
+          bodyTextPreview: String(document.body?.innerText || '')
+            .replace(/\\s+/g, ' ')
+            .trim()
+            .slice(0, 500),
+        }))()
+      `,
+    );
+  }
+
+  function buildCrawlerExtractionTargetUrls(item) {
+    return sortMeetingUrlsForExtraction([
+      ...(Array.isArray(item?.candidateUrls) ? item.candidateUrls : []),
+      item?.url || '',
+    ]);
+  }
+
+  async function navigatePageAndWait(
+    cdp,
+    url,
+    timeoutMs = DEFAULT_PAGE_NAVIGATION_TIMEOUT_MS,
+  ) {
+    await navigateWithCdp(cdp, url, {
+      timeoutMs,
+      settleMs: DEFAULT_CRAWL_SCROLL_SETTLE_MS,
+      errorFactory: (message) => new CliError(message),
+    });
+    return getCurrentPageSnapshot(cdp).catch(() => ({
+      title: '',
+      url,
+    }));
+  }
+
+  async function selectTranscriptPage(prompt, debugPort) {
+    const pages = await findPageTargets(debugPort);
+
+    if (pages.length === 0) {
+      throw new CliError(
+        'No browser pages were found. Open Microsoft Stream before continuing.',
+      );
+    }
+
     if (pages.length === 1) {
       return pages[0];
     }
-  
+
     const likelyMeetingPages = pages.filter((page) => isLikelyMeetingPage(page));
     if (likelyMeetingPages.length === 1) {
       return likelyMeetingPages[0];
     }
-  
+
     return chooseFromList(
       prompt,
       'Open pages',
       pages,
       (page) => `${page.title} (${page.url.slice(0, 80)})`,
-      '\nWhich tab has the Stream meeting? (number): ',
+      '\nWhich page contains the Microsoft Stream meeting? (number): ',
     );
   }
-  
+
   function printInitialRunInstructions(captureControl = 'manual') {
-    console.log('\nBrowser window is ready.');
+    console.log('\nBrowser is ready.');
     console.log('1. Open the meeting in Microsoft Stream.');
     if (captureControl === 'automatic') {
       console.log(
-        '2. Wait for the page to finish loading, then return here and press Enter.',
-      );
-      console.log(
-        '3. The extractor will start capture, reload once, and try the Transcript panel for you.',
+        '2. Return to this terminal and continue. The extractor will reload the page and manage the Transcript panel automatically.',
       );
       return;
     }
 
     console.log('2. Leave the Transcript panel closed for now.');
-    console.log('3. Return to this terminal so transcript capture can begin.');
+    console.log('3. Return to this terminal and continue so capture can be armed.');
   }
-  
+
   function printCaptureInstructions(debugEnabled = false) {
-    console.log('\nTranscript capture is ready.');
+    console.log('\nNetwork capture is armed.');
     if (debugEnabled) {
       console.log('1. Wait for the automatic page reload to finish.');
       console.log('2. Open the Transcript panel in Microsoft Stream.');
-      console.log('3. If the panel is already open, close and reopen it once.');
-      console.log('4. Let the transcript finish loading. Scroll once if more lines load as you move.');
+      console.log('3. If the panel is already open, close and reopen it if possible.');
+      console.log('4. Let the transcript load, and scroll once if the app lazily fetches chunks.');
       console.log(
-        '5. Watch this terminal for a confirmation if transcript data is detected.',
+        '5. Watch this terminal for a transcript-traffic confirmation if one is seen.',
       );
       console.log('6. Return to this terminal and press Enter.');
       return;
     }
-  
+
     console.log('1. Open the Transcript panel in Microsoft Stream.');
-    console.log('2. If the panel is already open, close and reopen it once.');
-    console.log('3. Let the transcript finish loading. Scroll once if more lines load as you move.');
+    console.log('2. If the panel is already open, close and reopen it if possible.');
+    console.log('3. Let the transcript load, and scroll once if the app lazily fetches chunks.');
     console.log(
-      '4. Watch this terminal for a confirmation if transcript data is detected.',
+      '4. Watch this terminal for a transcript-traffic confirmation if one is seen.',
     );
     console.log('5. Return to this terminal and press Enter.');
   }
 
-  function printAutomaticFallbackInstructions(reason = 'panel-open-failed') {
-    console.log('\nAutomatic mode needs one manual step. Transcript capture is still running.');
+  function printAutomaticFallbackInstructions() {
+    console.log('\nAutomatic mode needs a manual assist.');
+    console.log('1. Open or reopen the Transcript panel in Microsoft Stream.');
+    console.log('2. Let the transcript load, and scroll once if the app lazily fetches chunks.');
     console.log(
-      reason === 'panel-open-failed'
-        ? '1. In Stream, open or reopen the Transcript panel, then scroll once if more lines load as you move.'
-        : '1. In Stream, close and reopen the Transcript panel, then scroll once if more lines load as you move.',
+      '3. Watch this terminal for a transcript-traffic confirmation if one is seen.',
     );
-    console.log(
-      '2. Let the transcript finish loading, watch this terminal for a confirmation, then press Enter.',
-    );
+    console.log('4. Return to this terminal and press Enter.');
   }
 
-  function printNextExtractionInstructions(captureControl = 'manual') {
-    console.log('\nStart another extraction');
-    console.log(
-      '1. Open the next Microsoft Stream meeting in a new tab in the existing browser window.',
-    );
-    if (captureControl === 'automatic') {
-      console.log('2. Wait for the page to finish loading.');
-    } else {
-      console.log('2. Leave the Transcript panel closed for now.');
+  async function handleAutomaticManualAssistFallback(
+    prompt,
+    captureFeedback,
+    debugEnabled,
+    reason,
+    panelResult,
+    allowManualAssist,
+  ) {
+    printAutomaticFallbackSummary(reason, captureFeedback, panelResult);
+
+    if (!allowManualAssist) {
+      logAutomaticAction(
+        captureFeedback,
+        debugEnabled,
+        `${reason}, continuing without manual assist`,
+      );
+      console.log(
+        'Automatic mode: continuing without manual assist so batch extraction can keep moving.',
+      );
+      return;
     }
-    console.log(
-      '3. Return here and press Enter to reuse the same temporary profile, or type "done" to finish.',
+
+    logAutomaticAction(
+      captureFeedback,
+      debugEnabled,
+      `${reason}, falling back to manual assist`,
     );
-  }
-
-  async function promptForNextExtraction(prompt, captureControl = 'manual') {
-    printNextExtractionInstructions(captureControl);
-
-    while (true) {
-      const answer = (await prompt.ask('\nPress Enter to start another extraction, or type "done": '))
-        .trim()
-        .toLowerCase();
-      if (!answer) {
-        return true;
-      }
-
-      if (
-        answer === 'done' ||
-        answer === 'd' ||
-        answer === 'no' ||
-        answer === 'n' ||
-        answer === 'quit' ||
-        answer === 'exit'
-      ) {
-        return false;
-      }
-
-      console.log('Press Enter to continue, or type "done" to finish.');
-    }
+    printAutomaticFallbackInstructions();
+    await prompt.waitForEnter(
+      '\nPress Enter after the transcript panel has loaded...\n',
+    );
+    await sleep(DEFAULT_CAPTURE_SETTLE_MS);
   }
 
   function buildTranscriptPanelAutomationExpression(action = 'inspect') {
@@ -5694,7 +5807,7 @@ const runEmbeddedNetworkMode = (() => {
     }
 
     const detailSuffix = details ? ` ${JSON.stringify(details)}` : '';
-    console.log(`[automatic trace] ${step}${detailSuffix}`);
+    console.log(`[automatic debug] ${step}${detailSuffix}`);
   }
 
   function countAutomaticActions(captureFeedback, prefix) {
@@ -5751,17 +5864,17 @@ const runEmbeddedNetworkMode = (() => {
 
       if (captureFeedback.transcriptHintCount > 0) {
         lines.push(
-          `Detected ${captureFeedback.transcriptHintCount} possible transcript response` +
-            `${captureFeedback.transcriptHintCount === 1 ? '' : 's'}, but none produced a usable transcript yet.`,
+          `I saw ${captureFeedback.transcriptHintCount} transcript-like network response` +
+            `${captureFeedback.transcriptHintCount === 1 ? '' : 's'}, but none produced a usable transcript payload yet.`,
         );
       } else if (captureFeedback.candidateResponseCount > 0) {
         lines.push(
-          `Detected ${captureFeedback.candidateResponseCount} related Stream response` +
+          `I saw ${captureFeedback.candidateResponseCount} potentially relevant network response` +
             `${captureFeedback.candidateResponseCount === 1 ? '' : 's'}, but none looked transcript-specific.`,
         );
       } else {
         lines.push(
-          'No transcript data was detected after the automatic panel actions.',
+          'I did not see any transcript-like network responses after the automatic panel actions.',
         );
       }
     }
@@ -5830,19 +5943,6 @@ const runEmbeddedNetworkMode = (() => {
     );
   }
 
-  async function waitForTranscriptControl(
-    cdp,
-    timeoutMs = DEFAULT_AUTOMATIC_CONTROL_DISCOVERY_TIMEOUT_MS,
-  ) {
-    return waitForAsyncCondition(
-      async () => {
-        const state = await inspectTranscriptPanelUi(cdp);
-        return state.controlFound || state.panelLikelyOpen ? state : null;
-      },
-      timeoutMs,
-    );
-  }
-
   async function ensureTranscriptPanelOpenAutomatically(
     cdp,
     captureFeedback,
@@ -5882,7 +5982,7 @@ const runEmbeddedNetworkMode = (() => {
     }
 
     for (let attempt = 1; attempt <= 2; attempt += 1) {
-      let openResult = await performTranscriptPanelAction(cdp, 'open');
+      const openResult = await performTranscriptPanelAction(cdp, 'open');
       logAutomaticAction(
         captureFeedback,
         debugEnabled,
@@ -5890,35 +5990,12 @@ const runEmbeddedNetworkMode = (() => {
         summarizeTranscriptPanelUiState(openResult),
       );
       if (!openResult.controlFound && !openResult.panelLikelyOpen) {
-        const controlState = await waitForTranscriptControl(cdp);
-        logAutomaticAction(
-          captureFeedback,
-          debugEnabled,
-          `wait for transcript control attempt ${attempt}`,
-          summarizeTranscriptPanelUiState(controlState),
-        );
-        if (controlState?.panelLikelyOpen) {
-          return {
-            opened: true,
-            refreshed,
-            controlLabel: controlState.controlLabel || '',
-            state: controlState,
-          };
-        }
-        if (!controlState?.controlFound) {
-          continue;
-        }
-
-        openResult = await performTranscriptPanelAction(cdp, 'open');
-        logAutomaticAction(
-          captureFeedback,
-          debugEnabled,
-          `open transcript panel delayed attempt ${attempt}`,
-          summarizeTranscriptPanelUiState(openResult),
-        );
-        if (!openResult.controlFound && !openResult.panelLikelyOpen) {
-          continue;
-        }
+        return {
+          opened: false,
+          refreshed,
+          controlLabel: '',
+          state: openResult,
+        };
       }
 
       await sleep(DEFAULT_AUTOMATIC_CLICK_SETTLE_MS);
@@ -6005,12 +6082,13 @@ const runEmbeddedNetworkMode = (() => {
     prompt,
     captureFeedback,
     debugEnabled,
+    { allowManualAssist = true } = {},
   ) {
-    console.log('\nAutomatic mode: reloading the page and starting capture...');
+    console.log('\nAutomatic mode: reloading the page with capture armed...');
     logAutomaticAction(captureFeedback, debugEnabled, 'reload page');
     await reloadPageAndWait(cdp);
 
-    console.log('Automatic mode: looking for the Transcript button...');
+    console.log('Automatic mode: locating the Transcript control...');
     let panelResult = await ensureTranscriptPanelOpenAutomatically(
       cdp,
       captureFeedback,
@@ -6028,44 +6106,37 @@ const runEmbeddedNetworkMode = (() => {
 
     if (!panelResult.opened) {
       console.log(
-        'Automatic mode: could not open the Transcript panel. Manual help is next.',
+        'Automatic mode: could not open the Transcript panel automatically.',
       );
-      printAutomaticFallbackSummary(
-        'panel-open-failed',
-        captureFeedback,
-        panelResult,
-      );
-      logAutomaticAction(
+      await handleAutomaticManualAssistFallback(
+        prompt,
         captureFeedback,
         debugEnabled,
-        'automatic open failed, falling back to manual assist',
+        'panel-open-failed',
+        panelResult,
+        allowManualAssist,
       );
-      printAutomaticFallbackInstructions('panel-open-failed');
-      await prompt.waitForEnter(
-        '\nPress Enter after the Transcript panel looks loaded, or after this terminal says transcript data was detected...\n',
-      );
-      await sleep(DEFAULT_CAPTURE_SETTLE_MS);
       return;
     }
 
     console.log(
       panelResult.refreshed
         ? 'Automatic mode: refreshed and reopened the Transcript panel.'
-        : 'Automatic mode: opened the Transcript panel.',
+        : 'Automatic mode: opened the Transcript panel automatically.',
     );
     if (panelResult.controlLabel) {
-      console.log(`Automatic mode: used "${panelResult.controlLabel}".`);
+      console.log(`Automatic mode: using control "${panelResult.controlLabel}".`);
     }
 
     if (
       await nudgeTranscriptPanelAutomatically(cdp, captureFeedback, debugEnabled)
     ) {
       console.log(
-        'Automatic mode: scrolled the Transcript panel to load more lines.',
+        'Automatic mode: nudged the Transcript panel to trigger lazy loading.',
       );
     }
 
-    console.log('Automatic mode: waiting for transcript data to load...');
+    console.log('Automatic mode: waiting for transcript network traffic...');
     logAutomaticAction(
       captureFeedback,
       debugEnabled,
@@ -6081,7 +6152,7 @@ const runEmbeddedNetworkMode = (() => {
 
     if (!transcriptSignal) {
       console.log(
-        'Automatic mode: transcript data has not loaded yet. Trying one more scroll.',
+        'Automatic mode: no transcript traffic yet. Nudging the panel once more.',
       );
       logAutomaticAction(
         captureFeedback,
@@ -6097,7 +6168,7 @@ const runEmbeddedNetworkMode = (() => {
 
     if (!transcriptSignal) {
       console.log(
-        'Automatic mode: transcript data still has not loaded. Trying one panel refresh.',
+        'Automatic mode: no transcript traffic after opening the panel. Retrying one panel refresh.',
       );
       logAutomaticAction(
         captureFeedback,
@@ -6123,72 +6194,21 @@ const runEmbeddedNetworkMode = (() => {
 
     if (!transcriptSignal) {
       console.log(
-        'Automatic mode: transcript data still has not loaded. Trying one final reopen and scroll.',
+        'Automatic mode: transcript traffic was not detected automatically.',
       );
-      logAutomaticAction(
+      await handleAutomaticManualAssistFallback(
+        prompt,
         captureFeedback,
         debugEnabled,
-        'final automatic reopen-and-scroll pass',
-      );
-      panelResult = await ensureTranscriptPanelOpenAutomatically(
-        cdp,
-        captureFeedback,
-        debugEnabled,
-        {
-          refreshIfOpen: true,
-        },
-      );
-      logAutomaticAction(
-        captureFeedback,
-        debugEnabled,
-        'final automatic reopen-and-scroll result',
-        {
-          opened: panelResult.opened,
-          refreshed: panelResult.refreshed,
-          controlLabel: panelResult.controlLabel || '',
-          state: summarizeTranscriptPanelUiState(panelResult.state),
-        },
-      );
-      if (panelResult.opened) {
-        await sleep(DEFAULT_AUTOMATIC_CLICK_SETTLE_MS);
-        if (
-          await nudgeTranscriptPanelAutomatically(cdp, captureFeedback, debugEnabled)
-        ) {
-          console.log(
-            'Automatic mode: scrolled the Transcript panel after the final reopen.',
-          );
-        }
-        transcriptSignal = await waitForTranscriptSignal(
-          captureFeedback,
-          DEFAULT_AUTOMATIC_FINAL_REOPEN_SIGNAL_TIMEOUT_MS,
-        );
-      }
-    }
-
-    if (!transcriptSignal) {
-      console.log(
-        'Automatic mode: transcript data was not detected automatically.',
-      );
-      printAutomaticFallbackSummary(
         'traffic-not-detected',
-        captureFeedback,
         panelResult,
+        allowManualAssist,
       );
-      logAutomaticAction(
-        captureFeedback,
-        debugEnabled,
-        'automatic signal wait failed, falling back to manual assist',
-      );
-      printAutomaticFallbackInstructions('traffic-not-detected');
-      await prompt.waitForEnter(
-        '\nPress Enter after the Transcript panel looks loaded, or after this terminal says transcript data was detected...\n',
-      );
-      await sleep(DEFAULT_CAPTURE_SETTLE_MS);
       return;
     }
 
     console.log(
-      `Automatic mode: detected ${transcriptSignal.transcriptHintCount} transcript data response` +
+      `Automatic mode: observed ${transcriptSignal.transcriptHintCount} transcript-like network response` +
         `${transcriptSignal.transcriptHintCount === 1 ? '' : 's'}.`,
     );
     logAutomaticAction(
@@ -6204,7 +6224,7 @@ const runEmbeddedNetworkMode = (() => {
     );
     if (settledSignal) {
       console.log(
-        'Automatic mode: transcript data finished loading. Starting extraction.',
+        'Automatic mode: transcript response activity settled. Continuing extraction.',
       );
       logAutomaticAction(
         captureFeedback,
@@ -6214,7 +6234,7 @@ const runEmbeddedNetworkMode = (() => {
       );
     } else {
       console.log(
-        'Automatic mode: transcript data was detected, but loading did not fully settle before the wait ended.',
+        'Automatic mode: transcript traffic was seen, but the response did not fully settle before capture ended.',
       );
       logAutomaticAction(
         captureFeedback,
@@ -6228,127 +6248,1944 @@ const runEmbeddedNetworkMode = (() => {
 
     await sleep(DEFAULT_CAPTURE_SETTLE_MS);
   }
-  
+
   async function loadResponseBody(cdp, requestId, bodyCache) {
-    if (bodyCache.has(requestId)) {
-      return bodyCache.get(requestId);
+    return loadCapturedResponseBody(cdp, requestId, bodyCache, {
+      trimForPreview,
+    });
+  }
+
+  function createEmptyResponseBodyRecord(bodyError = '') {
+    return createResponseBodyRecord(
+      {
+        body: '',
+        bodyError,
+      },
+      { trimForPreview },
+    );
+  }
+
+  function normalizeMeetingUrl(value) {
+    const text = String(value || '').trim();
+    if (!text) {
+      return '';
     }
-  
-    let body = '';
-    let bodyError = '';
-    let base64Encoded = false;
-    let rawBodyBase64 = '';
-    let rawBodyByteLength = 0;
-    let rawBodyPreviewHex = '';
-  
+
+    if (!/^(https?:)?\/\//i.test(text) && !text.startsWith('/')) {
+      return '';
+    }
+
     try {
-      const result = await cdp.send('Network.getResponseBody', { requestId });
-      base64Encoded = Boolean(result.base64Encoded);
-      rawBodyBase64 = base64Encoded ? result.body : '';
-  
-      const rawBytes = base64Encoded
-        ? Buffer.from(result.body, 'base64')
-        : Buffer.from(result.body, 'utf8');
-      rawBodyByteLength = rawBytes.length;
-      rawBodyPreviewHex = rawBytes.subarray(0, 32).toString('hex');
-      body = base64Encoded ? rawBytes.toString('utf8') : result.body;
-    } catch (error) {
-      bodyError =
-        error instanceof Error ? error.message : 'Unable to capture response body.';
+      const url = new URL(text, DEFAULT_CRAWL_START_URL);
+      if (!/^https?:$/.test(url.protocol)) {
+        return '';
+      }
+
+      url.hash = '';
+      const sortedSearchParams = [...url.searchParams.entries()].sort(
+        ([leftKey, leftValue], [rightKey, rightValue]) =>
+          leftKey.localeCompare(rightKey) || leftValue.localeCompare(rightValue),
+      );
+      url.search = '';
+      for (const [key, paramValue] of sortedSearchParams) {
+        url.searchParams.append(key, paramValue);
+      }
+
+      return url.href;
+    } catch {
+      return '';
     }
-  
-    const record = {
-      body,
-      bodyLength: body.length,
-      bodyPreview: trimForPreview(body),
-      bodyError,
-      base64Encoded,
-      rawBodyBase64,
-      rawBodyByteLength,
-      rawBodyPreviewHex,
-      refetchedExternally: false,
-      refetchError: '',
-    };
-    bodyCache.set(requestId, record);
-    return record;
   }
-  
-  async function refetchBinaryBody(url) {
-    const response = await fetch(url, {
-      redirect: 'follow',
-    });
-  
-    if (!response.ok) {
-      throw new Error(`Refetch failed with status ${response.status}.`);
+
+  function buildMeetingExtractionUrl(value) {
+    const normalizedUrl = normalizeMeetingUrl(value);
+    if (!normalizedUrl) {
+      return '';
     }
-  
-    const rawBytes = Buffer.from(await response.arrayBuffer());
+
+    try {
+      const url = new URL(normalizedUrl, DEFAULT_CRAWL_START_URL);
+      const lowerHost = url.hostname.toLowerCase();
+      const lowerPath = url.pathname.toLowerCase();
+      const isSharePointVideoFile =
+        /\.sharepoint\.com$/.test(lowerHost) &&
+        /\.(mp4|m4v|mov|webm)$/.test(lowerPath) &&
+        !/\/_layouts\/15\/stream\.aspx$/.test(lowerPath);
+
+      if (!isSharePointVideoFile) {
+        return normalizedUrl;
+      }
+
+      if (String(url.searchParams.get('web') || '').trim() !== '1') {
+        url.searchParams.set('web', '1');
+      }
+
+      return normalizeMeetingUrl(url.toString());
+    } catch {
+      return normalizedUrl;
+    }
+  }
+
+  function buildMeetingExtractionComparisonKey(value) {
+    const executionUrl = buildMeetingExtractionUrl(value);
+    if (!executionUrl) {
+      return '';
+    }
+
+    try {
+      const url = new URL(executionUrl, DEFAULT_CRAWL_START_URL);
+      const lowerOrigin = url.origin.toLowerCase();
+      const lowerPath = url.pathname.toLowerCase();
+
+      if (
+        /\.sharepoint\.com$/.test(url.hostname.toLowerCase()) &&
+        /\.(mp4|m4v|mov|webm)$/.test(lowerPath)
+      ) {
+        return `${lowerOrigin}${lowerPath}`;
+      }
+
+      if (
+        /\.sharepoint\.com$/.test(url.hostname.toLowerCase()) &&
+        /\/_layouts\/15\/stream\.aspx$/.test(lowerPath)
+      ) {
+        const streamId = String(url.searchParams.get('id') || '').trim();
+        if (streamId) {
+          return `${lowerOrigin}${decodeURIComponent(streamId).toLowerCase()}`;
+        }
+      }
+
+      return executionUrl.toLowerCase();
+    } catch {
+      return executionUrl.toLowerCase();
+    }
+  }
+
+  function countMeetingUrlSearchParams(value) {
+    const executionUrl = buildMeetingExtractionUrl(value);
+    if (!executionUrl) {
+      return 0;
+    }
+
+    try {
+      return [...new URL(executionUrl, DEFAULT_CRAWL_START_URL).searchParams.keys()]
+        .length;
+    } catch {
+      return 0;
+    }
+  }
+
+  function isLikelyMeetingItemUrl(value) {
+    const normalizedUrl = normalizeMeetingUrl(value);
+    if (!normalizedUrl) {
+      return false;
+    }
+
+    const lowerUrl = normalizedUrl.toLowerCase();
+    if (
+      lowerUrl === DEFAULT_CRAWL_START_URL.toLowerCase() ||
+      /[?&]home=1(?:&|$)/.test(lowerUrl)
+    ) {
+      return false;
+    }
+
+    if (
+      !/(stream|sharepoint|m365\.cloud\.microsoft|meetingcatchupportal|cortana\.ai)/.test(
+        lowerUrl,
+      )
+    ) {
+      return false;
+    }
+
+    if (/meetingcatchupportal|meetingcatchup|stream\.aspx|watch|oneplayer|clip/.test(lowerUrl)) {
+      return true;
+    }
+
+    return /\/recordings?\/.*\.(mp4|m4v|mov|webm)(?:$|[?#])/.test(lowerUrl);
+  }
+
+  function isLikelyMeetingVideoFileUrl(value) {
+    const normalizedUrl = normalizeMeetingUrl(value);
+    if (!normalizedUrl) {
+      return false;
+    }
+
+    const lowerUrl = normalizedUrl.toLowerCase();
+    if (
+      !/(stream|sharepoint|m365\.cloud\.microsoft|meetingcatchupportal|cortana\.ai)/.test(
+        lowerUrl,
+      )
+    ) {
+      return false;
+    }
+
+    return /\.(mp4|m4v|mov|webm)(?:$|[?#])/.test(lowerUrl);
+  }
+
+  function scoreMeetingTargetUrl(value) {
+    const lowerUrl = normalizeMeetingUrl(value).toLowerCase();
+    if (!lowerUrl) {
+      return 0;
+    }
+
+    if (/meetingcatchupportal|meetingcatchup/.test(lowerUrl)) {
+      return 3;
+    }
+
+    if (/\/recordings?\/.*\.(mp4|m4v|mov|webm)(?:$|[?#])/.test(lowerUrl)) {
+      return 2;
+    }
+
+    if (/stream\.aspx|watch|oneplayer|clip/.test(lowerUrl)) {
+      return 1;
+    }
+
+    return 0;
+  }
+
+  function scoreMeetingExtractionTargetUrl(value) {
+    const lowerUrl = buildMeetingExtractionUrl(value).toLowerCase();
+    if (!lowerUrl) {
+      return 0;
+    }
+
+    if (/stream\.aspx|watch|oneplayer|clip/.test(lowerUrl)) {
+      return 4;
+    }
+
+    if (isLikelyMeetingVideoFileUrl(lowerUrl)) {
+      return 3;
+    }
+
+    if (/meetingcatchupportal|meetingcatchup/.test(lowerUrl)) {
+      return 2;
+    }
+
+    return isLikelyMeetingItemUrl(lowerUrl) ? 1 : 0;
+  }
+
+  function uniqueNormalizedMeetingUrls(values) {
+    return [
+      ...new Set(
+        (values || [])
+          .map((value) => normalizeMeetingUrl(value))
+          .filter(Boolean),
+      ),
+    ];
+  }
+
+  function sortMeetingUrlsForExtraction(values) {
+    const sortedUrls = (values || [])
+      .map((value) => buildMeetingExtractionUrl(value))
+      .filter((value) => scoreMeetingExtractionTargetUrl(value) > 0)
+      .filter(Boolean)
+      .sort((left, right) => {
+      const scoreDelta =
+        scoreMeetingExtractionTargetUrl(right) -
+        scoreMeetingExtractionTargetUrl(left);
+      if (scoreDelta !== 0) {
+        return scoreDelta;
+      }
+
+      const searchParamDelta =
+        countMeetingUrlSearchParams(right) - countMeetingUrlSearchParams(left);
+      if (searchParamDelta !== 0) {
+        return searchParamDelta;
+      }
+
+      return scoreMeetingTargetUrl(right) - scoreMeetingTargetUrl(left);
+    });
+
+    const dedupedUrls = [];
+    const seenComparisonKeys = new Set();
+
+    for (const value of sortedUrls) {
+      const comparisonKey = buildMeetingExtractionComparisonKey(value) || value;
+      if (seenComparisonKeys.has(comparisonKey)) {
+        continue;
+      }
+
+      seenComparisonKeys.add(comparisonKey);
+      dedupedUrls.push(value);
+    }
+
+    return dedupedUrls;
+  }
+
+  function extractUrlsFromText(value) {
+    const text = String(value || '');
+    const matches = text.match(/https?:\/\/[^\s"'<>\\]+/g) || [];
+
+    return matches
+      .map((match) => match.split(/(?:&quot;|&#34;|&apos;|&#39;)/i, 1)[0])
+      .map((match) => match.replace(/[),.;]+$/g, ''))
+      .filter(Boolean);
+  }
+
+  function extractMeetingDiscoveryItemsFromValue(value, sourceUrl = '') {
+    const matches = [];
+    const seenMatches = new Set();
+
+    function addMatch(candidateUrl, metadata, path) {
+      const normalizedUrl = normalizeMeetingUrl(candidateUrl);
+      if (!isLikelyMeetingItemUrl(normalizedUrl)) {
+        return;
+      }
+
+      const key = `${normalizedUrl}|${path}`;
+      if (seenMatches.has(key)) {
+        return;
+      }
+
+      seenMatches.add(key);
+      matches.push({
+        url: normalizedUrl,
+        title: normalizeInlineText(metadata?.title || ''),
+        subtitle: normalizeInlineText(metadata?.subtitle || ''),
+        identityKey: normalizeInlineText(metadata?.identityKey || ''),
+        candidateUrls: [normalizedUrl],
+        sourceUrl,
+        path,
+      });
+    }
+
+    function walk(current, path, depth = 0) {
+      if (depth > 10 || current == null) {
+        return;
+      }
+
+      if (typeof current === 'string') {
+        for (const candidateUrl of extractUrlsFromText(current)) {
+          addMatch(candidateUrl, {}, path);
+        }
+        return;
+      }
+
+      if (Array.isArray(current)) {
+        current.forEach((entry, index) => {
+          walk(entry, `${path}[${index}]`, depth + 1);
+        });
+        return;
+      }
+
+      if (typeof current !== 'object') {
+        return;
+      }
+
+      const title = getFirstStringValue(current, [
+        'title',
+        'name',
+        'displayName',
+        'meetingTitle',
+        'subject',
+        'fileName',
+        'label',
+      ]);
+      const subtitle = getFirstStringValue(current, [
+        'description',
+        'sharedBy',
+        'sharedByName',
+        'createdBy',
+        'createdByName',
+        'ownerName',
+      ]);
+      const extension = getFirstStringValue(current, [
+        'extension',
+        'fileExtension',
+        'file_extension',
+      ]).toLowerCase();
+      const itemType = getFirstStringValue(current, ['type']).toLowerCase();
+      const fileType = getFirstStringValue(current, [
+        'fileType',
+        'file_type',
+        'app',
+      ]).toLowerCase();
+      const isMeetingRecording =
+        current?.is_meeting_recording === true ||
+        current?.isMeetingRecording === true ||
+        String(
+          current?.is_meeting_recording ?? current?.isMeetingRecording ?? '',
+        ).toLowerCase() === 'true';
+      const looksLikeVideoFile =
+        ['mp4', 'm4v', 'mov', 'webm'].includes(extension) ||
+        itemType === 'video' ||
+        fileType === 'stream';
+      const identityKey =
+        normalizeInlineText(current?.resource_id || current?.resourceId || '') ||
+        normalizeInlineText(current?.doc_id || current?.docId || '') ||
+        normalizeInlineText(current?.file_id || current?.fileId || '') ||
+        normalizeInlineText(current?.sharepoint_info?.unique_id || '') ||
+        normalizeInlineText(current?.sharepointIds?.listItemUniqueId || '') ||
+        normalizeInlineText(current?.sharepointIds?.driveItemId || '') ||
+        normalizeInlineText(current?.sharepointIds?.itemId || '') ||
+        normalizeInlineText(current?.onedrive_info?.item_id || '');
+
+      if (isMeetingRecording || looksLikeVideoFile) {
+        const candidateKeys = [
+          'meeting_catchup_link',
+          'meetingCatchupLink',
+          'canonicalUrl',
+          'canonical_url',
+          'webUrl',
+          'web_url',
+          'url',
+          'mru_url',
+          'shareUrl',
+          'share_url',
+          'playerUrl',
+          'player_url',
+          'downloadUrl',
+          'download_url',
+        ];
+        candidateKeys.forEach((key) => {
+          if (typeof current[key] === 'string') {
+            addMatch(
+              current[key],
+              { title, subtitle, identityKey },
+              `${path}.${key}`,
+            );
+          }
+        });
+        return;
+      }
+
+      for (const [key, child] of Object.entries(current)) {
+        const childPath = `${path}.${key}`;
+
+        if (typeof child === 'string') {
+          if (
+            /url|uri|href|link|path|weburl|shareurl|watchurl|playerurl/i.test(key) ||
+            isLikelyMeetingItemUrl(child)
+          ) {
+            addMatch(child, { title, subtitle }, childPath);
+          } else {
+            for (const candidateUrl of extractUrlsFromText(child)) {
+              addMatch(candidateUrl, { title, subtitle }, childPath);
+            }
+          }
+          continue;
+        }
+
+        walk(child, childPath, depth + 1);
+      }
+    }
+
+    walk(value, '$');
+    return matches;
+  }
+
+  function extractMeetingDiscoveryItemsFromBody(body, sourceUrl = '') {
+    const trimmed = stripUtf8Bom(String(body || '')).trim();
+    if (!trimmed) {
+      return [];
+    }
+
+    const jsonValue = tryParseJsonLenient(trimmed);
+    if (jsonValue != null) {
+      return extractMeetingDiscoveryItemsFromValue(jsonValue, sourceUrl);
+    }
+
+    return extractUrlsFromText(trimmed)
+      .map((candidateUrl) => ({
+        url: normalizeMeetingUrl(candidateUrl),
+        title: '',
+        subtitle: '',
+        sourceUrl,
+        path: '$',
+      }))
+      .filter((item) => isLikelyMeetingItemUrl(item.url));
+  }
+
+  function normalizeMeetingComparisonTitle(value) {
+    return normalizeInlineText(
+      String(value || '')
+        .replace(/^stream\s+/i, '')
+        .replace(
+          /-\d{8}_\d{6}-meeting\s+(?:recording|transcript)\.(?:mp4|m4v|mov|webm)$/i,
+          '',
+        )
+        .replace(/\.(?:mp4|m4v|mov|webm)$/i, '')
+        .replace(/\{placeholder\}/gi, 'placeholder')
+        .replace(/[|/]+/g, ' ')
+        .replace(/[^a-z0-9]+/gi, ' '),
+    ).toLowerCase();
+  }
+
+  function buildMeetingComparisonKey(value) {
+    return normalizeMeetingComparisonTitle(value).replace(/\s+/g, '');
+  }
+
+  function parseGraphThumbnailDriveItem(value) {
+    const normalizedUrl = normalizeMeetingUrl(value);
+    if (!normalizedUrl) {
+      return null;
+    }
+
+    const match = normalizedUrl.match(
+      /^https:\/\/graph\.microsoft\.com\/v1\.0\/drives\/([^/]+)\/items\/([^/]+)\/thumbnails\//i,
+    );
+    if (!match) {
+      return null;
+    }
+
     return {
-      body: rawBytes.toString('utf8'),
-      bodyLength: rawBytes.length,
-      bodyPreview: trimForPreview(rawBytes.toString('utf8')),
-      bodyError: '',
-      base64Encoded: true,
-      rawBodyBase64: rawBytes.toString('base64'),
-      rawBodyByteLength: rawBytes.length,
-      rawBodyPreviewHex: rawBytes.subarray(0, 32).toString('hex'),
-      refetchedExternally: true,
-      refetchError: '',
+      driveId: decodeURIComponent(match[1]),
+      itemId: decodeURIComponent(match[2]),
+      thumbnailUrl: normalizedUrl,
     };
   }
-  
-  async function reloadPageAndWait(cdp, timeoutMs = DEFAULT_CDP_TIMEOUT_MS) {
-    await cdp.send('Page.enable');
-  
-    await new Promise((resolveReload, rejectReload) => {
-      let settled = false;
-      const timeout = setTimeout(() => {
-        if (settled) {
-          return;
-        }
-  
-        settled = true;
-        stopListening();
-        resolveReload();
-      }, timeoutMs);
-  
-      const stopListening = cdp.on('Page.loadEventFired', () => {
-        if (settled) {
-          return;
-        }
-  
-        settled = true;
-        clearTimeout(timeout);
-        stopListening();
-        resolveReload();
-      });
-  
-      cdp.send('Page.reload', { ignoreCache: true }).catch((error) => {
-        if (settled) {
-          return;
-        }
-  
-        settled = true;
-        clearTimeout(timeout);
-        stopListening();
-        rejectReload(error);
-      });
-    });
-  
-    await sleep(1_000);
+
+  function getGraphAuthorizationHeader(graphThumbnailCandidates) {
+    if (
+      !(graphThumbnailCandidates instanceof Map) ||
+      graphThumbnailCandidates.size === 0
+    ) {
+      return '';
+    }
+
+    return (
+      [...new Set(
+        [...graphThumbnailCandidates.values()]
+          .map((candidate) => String(candidate?.authorization || '').trim())
+          .filter(Boolean),
+      )][0] || ''
+    );
   }
-  
-  async function captureStreamNetwork(
+
+  function buildGraphItemMetadataUrl(driveId, itemId) {
+    const metadataUrl = new URL(
+      `https://graph.microsoft.com/v1.0/drives/${encodeURIComponent(driveId)}/items/${encodeURIComponent(itemId)}`,
+    );
+    metadataUrl.searchParams.set(
+      '$select',
+      'id,name,webUrl,file,video,sharepointIds,parentReference,@microsoft.graph.downloadUrl',
+    );
+    return metadataUrl.toString();
+  }
+
+  async function fetchGraphItemMetadata(driveId, itemId, authorization) {
+    if (!driveId || !itemId || !authorization) {
+      return null;
+    }
+
+    let response;
+    try {
+      response = await fetch(buildGraphItemMetadataUrl(driveId, itemId), {
+        headers: {
+          Authorization: authorization,
+          Accept: 'application/json',
+        },
+      });
+    } catch {
+      return null;
+    }
+
+    if (!response.ok) {
+      return null;
+    }
+
+    try {
+      return await response.json();
+    } catch {
+      return null;
+    }
+  }
+
+  async function resolveGraphThumbnailMeetingItems(
+    graphThumbnailCandidates,
+    {
+      visibleTitles = [],
+      existingNetworkItems = [],
+    } = {},
+  ) {
+    if (!(graphThumbnailCandidates instanceof Map) || graphThumbnailCandidates.size === 0) {
+      return [];
+    }
+
+    const authorization = getGraphAuthorizationHeader(graphThumbnailCandidates);
+    if (!authorization) {
+      return [];
+    }
+
+    const visibleQueueByKey = new Map();
+    for (const title of visibleTitles) {
+      const key = buildMeetingComparisonKey(title);
+      if (!key) {
+        continue;
+      }
+
+      if (!visibleQueueByKey.has(key)) {
+        visibleQueueByKey.set(key, []);
+      }
+      visibleQueueByKey.get(key).push(normalizeInlineText(title));
+    }
+
+    const existingNetworkCounts = new Map();
+    for (const item of existingNetworkItems) {
+      const key = buildMeetingComparisonKey(item?.title || '');
+      if (!key) {
+        continue;
+      }
+
+      existingNetworkCounts.set(
+        key,
+        (existingNetworkCounts.get(key) || 0) + 1,
+      );
+    }
+
+    const outstandingVisibleByKey = new Map();
+    for (const [key, titles] of visibleQueueByKey.entries()) {
+      const alreadyCovered = existingNetworkCounts.get(key) || 0;
+      const remainingTitles = titles.slice(alreadyCovered);
+      if (remainingTitles.length > 0) {
+        outstandingVisibleByKey.set(key, remainingTitles);
+      }
+    }
+
+    if (outstandingVisibleByKey.size === 0) {
+      return [];
+    }
+
+    const resolvedGraphItems = [];
+    for (const candidate of graphThumbnailCandidates.values()) {
+      const payload = await fetchGraphItemMetadata(
+        candidate.driveId,
+        candidate.itemId,
+        authorization,
+      );
+      if (!payload) {
+        continue;
+      }
+
+      const itemName = normalizeInlineText(payload?.name || '');
+      const key = buildMeetingComparisonKey(itemName);
+      if (!key || !outstandingVisibleByKey.has(key)) {
+        continue;
+      }
+
+      const queue = outstandingVisibleByKey.get(key);
+      const title = queue.shift() || itemName;
+      if (queue.length === 0) {
+        outstandingVisibleByKey.delete(key);
+      }
+
+      const targetUrl =
+        normalizeMeetingUrl(
+          payload?.webUrl ||
+            payload?.['@microsoft.graph.downloadUrl'] ||
+            '',
+        ) || '';
+      if (!targetUrl || !isLikelyMeetingItemUrl(targetUrl)) {
+        continue;
+      }
+
+      resolvedGraphItems.push({
+        url: targetUrl,
+        title,
+        subtitle: normalizeInlineText(
+          payload?.parentReference?.path || '',
+        ),
+        identityKey:
+          normalizeInlineText(payload?.sharepointIds?.listItemUniqueId || '') ||
+          normalizeInlineText(payload?.id || ''),
+        sourceUrl: normalizeMeetingUrl(candidate.thumbnailUrl),
+        path: '$graphThumbnail',
+      });
+    }
+
+    return resolvedGraphItems;
+  }
+
+  async function resolveDomGraphMeetingItems(
+    domItems,
+    {
+      graphThumbnailCandidates,
+      existingNetworkItems = [],
+    } = {},
+  ) {
+    if (!Array.isArray(domItems) || domItems.length === 0) {
+      return [];
+    }
+
+    const authorization = getGraphAuthorizationHeader(graphThumbnailCandidates);
+    if (!authorization) {
+      return [];
+    }
+
+    const existingNetworkUrls = new Set(
+      existingNetworkItems
+        .map((item) => normalizeMeetingUrl(item?.url || ''))
+        .filter(Boolean),
+    );
+    const existingNetworkIdentityKeys = new Set(
+      existingNetworkItems
+        .map((item) => normalizeInlineText(item?.identityKey || ''))
+        .filter(Boolean),
+    );
+    const requestedGraphItems = new Set();
+    const resolvedGraphItems = [];
+
+    for (const item of domItems) {
+      const existingUrl = normalizeMeetingUrl(item?.url || '');
+      const identityKey = normalizeInlineText(item?.identityKey || '');
+      const driveId = normalizeInlineText(item?.graphDriveId || '');
+      const itemId = normalizeInlineText(item?.graphItemId || '');
+      if (!driveId || !itemId) {
+        continue;
+      }
+
+      if (
+        (existingUrl && existingNetworkUrls.has(existingUrl)) ||
+        (identityKey && existingNetworkIdentityKeys.has(identityKey))
+      ) {
+        continue;
+      }
+
+      const requestKey = `${driveId}\t${itemId}`;
+      if (requestedGraphItems.has(requestKey)) {
+        continue;
+      }
+      requestedGraphItems.add(requestKey);
+
+      const payload = await fetchGraphItemMetadata(
+        driveId,
+        itemId,
+        authorization,
+      );
+      if (!payload) {
+        continue;
+      }
+
+      const resolvedUrl =
+        normalizeMeetingUrl(
+          payload?.webUrl || payload?.['@microsoft.graph.downloadUrl'] || '',
+        ) || existingUrl;
+      if (
+        !resolvedUrl ||
+        (!isLikelyMeetingItemUrl(resolvedUrl) &&
+          !isLikelyMeetingVideoFileUrl(resolvedUrl))
+      ) {
+        continue;
+      }
+
+      resolvedGraphItems.push({
+        url: resolvedUrl,
+        title: normalizeInlineText(item?.title || '') || normalizeInlineText(payload?.name || '') || resolvedUrl,
+        subtitle:
+          normalizeInlineText(item?.subtitle || '') ||
+          normalizeInlineText(payload?.parentReference?.path || ''),
+        identityKey:
+          identityKey ||
+          normalizeInlineText(payload?.sharepointIds?.listItemUniqueId || '') ||
+          normalizeInlineText(payload?.id || ''),
+        sourceUrl: buildGraphItemMetadataUrl(driveId, itemId),
+        path: '$graphDomItem',
+      });
+      existingNetworkUrls.add(resolvedUrl);
+      if (identityKey) {
+        existingNetworkIdentityKeys.add(identityKey);
+      }
+    }
+
+    return resolvedGraphItems;
+  }
+
+  function mergeDiscoveredMeetingItems(networkItems = [], domItems = []) {
+    const mergedItems = new Map();
+
+    function buildCandidateUrls(item) {
+      return uniqueNormalizedMeetingUrls([
+        item?.url || '',
+        ...(Array.isArray(item?.candidateUrls) ? item.candidateUrls : []),
+      ]);
+    }
+
+    function buildCanonicalUrl(item) {
+      const sortedCandidateUrls = sortMeetingUrlsForExtraction(
+        buildCandidateUrls(item),
+      );
+      return sortedCandidateUrls[0] || normalizeMeetingUrl(item?.url || '');
+    }
+
+    function buildMergeLookupUrls(item) {
+      return uniqueNormalizedMeetingUrls([
+        normalizeMeetingUrl(item?.url || ''),
+        buildCanonicalUrl(item),
+      ]);
+    }
+
+    function findExistingMergedKey(lookupUrls, identityKey = '') {
+      if (identityKey) {
+        for (const [existingKey, existingItem] of mergedItems.entries()) {
+          if (existingItem.identityKey === identityKey) {
+            return existingKey;
+          }
+        }
+      }
+
+      for (const [existingKey, existingItem] of mergedItems.entries()) {
+        const existingLookupUrls = uniqueNormalizedMeetingUrls([
+          existingItem.url,
+          ...(Array.isArray(existingItem.mergeLookupUrls)
+            ? existingItem.mergeLookupUrls
+            : []),
+        ]);
+        if (lookupUrls.some((lookupUrl) => existingLookupUrls.includes(lookupUrl))) {
+          return existingKey;
+        }
+      }
+
+      return '';
+    }
+
+    function updateMergedItemUrl(mergedItem) {
+      const candidateUrls = uniqueNormalizedMeetingUrls(mergedItem.candidateUrls || []);
+      mergedItem.candidateUrls = candidateUrls;
+
+      let preferredUrl = mergedItem.url;
+      let preferredUrlScore = scoreMeetingTargetUrl(preferredUrl);
+      for (const candidateUrl of candidateUrls) {
+        const candidateScore = scoreMeetingTargetUrl(candidateUrl);
+        if (candidateScore > preferredUrlScore) {
+          preferredUrl = candidateUrl;
+          preferredUrlScore = candidateScore;
+        }
+      }
+
+      mergedItem.url = preferredUrl || candidateUrls[0] || mergedItem.url;
+      mergedItem.preferredUrlScore = preferredUrlScore;
+      mergedItem.mergeLookupUrls = uniqueNormalizedMeetingUrls([
+        ...(Array.isArray(mergedItem.mergeLookupUrls)
+          ? mergedItem.mergeLookupUrls
+          : []),
+        mergedItem.url,
+      ]);
+    }
+
+    function ensureMergedItem(item) {
+      const identityKey = normalizeInlineText(item?.identityKey || '');
+      const lookupUrls = buildMergeLookupUrls(item);
+      const candidateUrls = buildCandidateUrls(item);
+      const normalizedUrl = lookupUrls[0] || normalizeMeetingUrl(item?.url || '');
+      if (!normalizedUrl) {
+        return null;
+      }
+
+      let mergedKey = findExistingMergedKey(lookupUrls, identityKey);
+      if (!mergedKey) {
+        mergedKey = identityKey || normalizedUrl;
+      }
+
+      if (!mergedItems.has(mergedKey)) {
+        mergedItems.set(mergedKey, {
+          url: normalizedUrl,
+          identityKey,
+          title: '',
+          subtitle: '',
+          candidateUrls: candidateUrls.length > 0 ? candidateUrls : [normalizedUrl],
+          mergeLookupUrls: lookupUrls,
+          sources: [],
+          discoveryPaths: [],
+          discoverySourceUrls: [],
+          domOrder: Number.POSITIVE_INFINITY,
+          preferredUrlScore: scoreMeetingTargetUrl(normalizedUrl),
+        });
+      }
+
+      const mergedItem = mergedItems.get(mergedKey);
+      if (!mergedItem.identityKey && identityKey) {
+        mergedItem.identityKey = identityKey;
+      }
+      mergedItem.candidateUrls = uniqueNormalizedMeetingUrls([
+        ...(mergedItem.candidateUrls || []),
+        ...candidateUrls,
+      ]);
+      mergedItem.mergeLookupUrls = uniqueNormalizedMeetingUrls([
+        ...(Array.isArray(mergedItem.mergeLookupUrls)
+          ? mergedItem.mergeLookupUrls
+          : []),
+        ...lookupUrls,
+      ]);
+      updateMergedItemUrl(mergedItem);
+
+      return mergedItem;
+    }
+
+    domItems.forEach((item, index) => {
+      const mergedItem = ensureMergedItem(item);
+      if (!mergedItem) {
+        return;
+      }
+
+      const title = normalizeInlineText(item?.title || '');
+      const subtitle = normalizeInlineText(item?.subtitle || '');
+      mergedItem.title = title || mergedItem.title;
+      mergedItem.subtitle = subtitle || mergedItem.subtitle;
+      mergedItem.candidateUrls = uniqueNormalizedMeetingUrls([
+        ...(mergedItem.candidateUrls || []),
+        ...(Array.isArray(item?.candidateUrls) ? item.candidateUrls : []),
+      ]);
+      mergedItem.domOrder = Math.min(mergedItem.domOrder, index);
+      mergedItem.sources = [...new Set([...mergedItem.sources, 'dom'])];
+    });
+
+    networkItems.forEach((item) => {
+      const mergedItem = ensureMergedItem(item);
+      if (!mergedItem) {
+        return;
+      }
+
+      const title = normalizeInlineText(item?.title || '');
+      const subtitle = normalizeInlineText(item?.subtitle || '');
+      if (!mergedItem.title) {
+        mergedItem.title = title;
+      }
+      if (!mergedItem.subtitle) {
+        mergedItem.subtitle = subtitle;
+      }
+      mergedItem.candidateUrls = uniqueNormalizedMeetingUrls([
+        ...(mergedItem.candidateUrls || []),
+        ...(Array.isArray(item?.candidateUrls) ? item.candidateUrls : []),
+      ]);
+      mergedItem.sources = [...new Set([...mergedItem.sources, 'network'])];
+
+      const path = String(item?.path || '').trim();
+      if (path && !mergedItem.discoveryPaths.includes(path)) {
+        mergedItem.discoveryPaths.push(path);
+      }
+
+      const sourceUrl = normalizeMeetingUrl(item?.sourceUrl || '');
+      if (sourceUrl && !mergedItem.discoverySourceUrls.includes(sourceUrl)) {
+        mergedItem.discoverySourceUrls.push(sourceUrl);
+      }
+    });
+
+    return [...mergedItems.values()]
+      .sort((left, right) => {
+        if (left.domOrder !== right.domOrder) {
+          return left.domOrder - right.domOrder;
+        }
+
+        return (left.title || left.url).localeCompare(right.title || right.url);
+      })
+      .map((item) => {
+        const candidateUrls = sortMeetingUrlsForExtraction(
+          item.candidateUrls || [item.url],
+        );
+        return {
+          url: candidateUrls[0] || item.url,
+          identityKey: item.identityKey,
+          title: item.title || item.url,
+          subtitle: item.subtitle,
+          candidateUrls,
+          sources: item.sources,
+          discoveryPaths: item.discoveryPaths,
+          discoverySourceUrls: item.discoverySourceUrls,
+        };
+      });
+  }
+
+  function buildMeetingDiscoveryExpression() {
+    const settleMs = JSON.stringify(DEFAULT_CRAWL_SCROLL_SETTLE_MS);
+
+    return `
+      (async () => {
+        const settleMs = ${settleMs};
+
+        function wait(ms) {
+          return new Promise((resolveWait) => setTimeout(resolveWait, ms));
+        }
+
+        function normalizeText(value) {
+          return String(value || '').replace(/\\s+/g, ' ').trim();
+        }
+
+        function isVisible(element) {
+          if (!(element instanceof HTMLElement)) {
+            return false;
+          }
+
+          const style = window.getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          return (
+            style.display !== 'none' &&
+            style.visibility !== 'hidden' &&
+            rect.width > 8 &&
+            rect.height > 8
+          );
+        }
+
+        function normalizeHref(value) {
+          try {
+            return new URL(String(value || ''), location.href).href;
+          } catch {
+            return '';
+          }
+        }
+
+        function normalizeBoolean(value) {
+          if (typeof value === 'boolean') {
+            return value;
+          }
+
+          const normalized = normalizeText(value).toLowerCase();
+          return normalized === 'true' || normalized === '1' || normalized === 'yes';
+        }
+
+        function isLikelyMeetingHref(value) {
+          const href = normalizeHref(value).toLowerCase();
+          if (!href) {
+            return false;
+          }
+
+          if (
+            href === ${JSON.stringify(DEFAULT_CRAWL_START_URL.toLowerCase())} ||
+            /[?&]home=1(?:&|$)/.test(href)
+          ) {
+            return false;
+          }
+
+          if (!/(stream|sharepoint|m365\\.cloud\\.microsoft)/.test(href)) {
+            if (!/(meetingcatchupportal|cortana\\.ai)/.test(href)) {
+              return false;
+            }
+          }
+
+          return /meetingcatchupportal|meetingcatchup|stream\\.aspx|recording|watch|oneplayer|clip|\\/recordings?\\/.*\\.(mp4|m4v|mov|webm)(?:$|[?#])/.test(
+            href,
+          );
+        }
+
+        function scoreMeetingHref(value) {
+          const href = normalizeHref(value).toLowerCase();
+          if (!href) {
+            return 0;
+          }
+
+          if (/meetingcatchupportal|meetingcatchup/.test(href)) {
+            return 4;
+          }
+
+          if (/\\/recordings?\\/.*\\.(mp4|m4v|mov|webm)(?:$|[?#])/.test(href)) {
+            return 3;
+          }
+
+          if (/stream\\.aspx|watch|oneplayer|clip/.test(href)) {
+            return 2;
+          }
+
+          return isLikelyMeetingHref(href) ? 1 : 0;
+        }
+
+        function pickBestMeetingHref(values) {
+          let bestHref = '';
+          let bestScore = 0;
+
+          for (const value of values) {
+            const href = normalizeHref(value);
+            const score = scoreMeetingHref(href);
+            if (!href || score <= 0) {
+              continue;
+            }
+
+            if (!bestHref || score > bestScore) {
+              bestHref = href;
+              bestScore = score;
+            }
+          }
+
+          return bestHref;
+        }
+
+        function looksActive(element) {
+          const attributeState =
+            String(
+              element.getAttribute('aria-selected') ||
+                element.getAttribute('aria-pressed') ||
+                '',
+            ).toLowerCase() === 'true';
+          if (attributeState) {
+            return true;
+          }
+
+          return /active|selected|current/.test(
+            [
+              element.className,
+              element.getAttribute('data-is-active') || '',
+              element.getAttribute('data-active') || '',
+            ]
+              .join(' ')
+              .toLowerCase(),
+          );
+        }
+
+        function buildControlLabel(element) {
+          return normalizeText(
+            element.getAttribute('aria-label') ||
+              element.textContent ||
+              element.innerText ||
+              '',
+          );
+        }
+
+        function findMeetingsControl() {
+          const candidates = [
+            ...document.querySelectorAll('button, [role="tab"], [role="button"], a'),
+          ].filter(isVisible);
+
+          const matches = candidates
+            .map((element) => ({
+              element,
+              label: buildControlLabel(element),
+            }))
+            .filter((candidate) => /^meetings$/i.test(candidate.label));
+
+          matches.sort((left, right) => {
+            const leftScore = looksActive(left.element) ? 1 : 0;
+            const rightScore = looksActive(right.element) ? 1 : 0;
+            return rightScore - leftScore;
+          });
+
+          return matches[0] || null;
+        }
+
+        function clickElement(element) {
+          element.dispatchEvent(
+            new MouseEvent('mousedown', { bubbles: true, cancelable: true }),
+          );
+          element.dispatchEvent(
+            new MouseEvent('mouseup', { bubbles: true, cancelable: true }),
+          );
+          element.click();
+        }
+
+        function getTextLines(element) {
+          return String(element?.innerText || '')
+            .split(/\\r?\\n/)
+            .map((line) => normalizeText(line))
+            .filter(Boolean);
+        }
+
+        function getReactAttachedValue(element, prefixes) {
+          if (!element || typeof element !== 'object') {
+            return null;
+          }
+
+          for (const key of Object.keys(element)) {
+            if (prefixes.some((prefix) => key.startsWith(prefix))) {
+              return element[key];
+            }
+          }
+
+          return null;
+        }
+
+        function findReactItemFromFiber(rootFiber) {
+          if (!rootFiber || typeof rootFiber !== 'object') {
+            return null;
+          }
+
+          const seen = new Set();
+          const stack = [rootFiber];
+
+          while (stack.length > 0) {
+            const fiber = stack.pop();
+            if (!fiber || typeof fiber !== 'object' || seen.has(fiber)) {
+              continue;
+            }
+
+            seen.add(fiber);
+
+            const propsCandidates = [fiber.pendingProps, fiber.memoizedProps];
+            for (const props of propsCandidates) {
+              if (props && typeof props.item === 'object' && props.item) {
+                return props.item;
+              }
+            }
+
+            if (fiber.child) {
+              stack.push(fiber.child);
+            }
+            if (fiber.sibling) {
+              stack.push(fiber.sibling);
+            }
+          }
+
+          return null;
+        }
+
+        function findReactItemForElement(element) {
+          const directProps = getReactAttachedValue(element, [
+            '__reactProps$',
+            '__reactProps',
+          ]);
+          if (directProps && typeof directProps.item === 'object' && directProps.item) {
+            return directProps.item;
+          }
+
+          const fiber = getReactAttachedValue(element, [
+            '__reactFiber$',
+            '__reactFiber',
+            '__reactInternalInstance$',
+          ]);
+          return findReactItemFromFiber(fiber);
+        }
+
+        function findReactItemForCard(card) {
+          const descendants = [card, ...card.querySelectorAll('*')];
+          const maxNodesToInspect = 80;
+          for (let index = 0; index < descendants.length && index < maxNodesToInspect; index += 1) {
+            const item = findReactItemForElement(descendants[index]);
+            if (item && typeof item === 'object') {
+              return item;
+            }
+          }
+
+          return null;
+        }
+
+        function firstNormalizedString(values) {
+          for (const value of values) {
+            const normalized = normalizeText(value);
+            if (normalized) {
+              return normalized;
+            }
+          }
+
+          return '';
+        }
+
+        function buildCardIdentityKey(item) {
+          return firstNormalizedString([
+            item?.resourceId,
+            item?.resource_id,
+            item?.docId,
+            item?.doc_id,
+            item?.fileId,
+            item?.file_id,
+            item?.sharepointIds?.listItemUniqueId,
+            item?.sharepointIds?.driveItemId,
+            item?.sharepointIds?.itemId,
+            item?.sharepoint_info?.unique_id,
+            item?.onedrive_info?.item_id,
+          ]);
+        }
+
+        function buildCardGraphDriveId(item) {
+          return firstNormalizedString([
+            item?.driveId,
+            item?.drive_id,
+          ]);
+        }
+
+        function buildCardGraphItemId(item) {
+          return firstNormalizedString([
+            item?.docId,
+            item?.doc_id,
+            item?.sharepointIds?.driveItemId,
+            item?.sharepointIds?.itemId,
+          ]);
+        }
+
+        function buildCardUrlCandidates(item) {
+          return [
+            item?.meetingCatchupLink,
+            item?.meetingCatchUpLink,
+            item?.meeting_catchup_link,
+            item?.canonicalUrl,
+            item?.canonical_url,
+            item?.webUrl,
+            item?.web_url,
+            item?.url,
+            item?.mru_url,
+            item?.shareUrl,
+            item?.share_url,
+            item?.playerUrl,
+            item?.player_url,
+            item?.downloadUrl,
+            item?.download_url,
+          ]
+            .map((value) => normalizeHref(value))
+            .filter(Boolean);
+        }
+
+        function sortExtractionCandidates(values) {
+          const uniqueValues = [...new Set((values || []).map((value) => normalizeHref(value)).filter(Boolean))];
+          function scoreExtractionHref(value) {
+            const href = normalizeHref(value).toLowerCase();
+            if (!href) {
+              return 0;
+            }
+
+            if (/stream\\.aspx|watch|oneplayer|clip/.test(href)) {
+              return 4;
+            }
+
+            if (/\\.(mp4|m4v|mov|webm)(?:$|[?#])/.test(href)) {
+              return 3;
+            }
+
+            if (/meetingcatchupportal|meetingcatchup/.test(href)) {
+              return 2;
+            }
+
+            return isLikelyMeetingHref(href) ? 1 : 0;
+          }
+
+          uniqueValues.sort((left, right) => scoreExtractionHref(right) - scoreExtractionHref(left));
+          return uniqueValues;
+        }
+
+        function stripStreamPrefix(value) {
+          return normalizeText(String(value || '').replace(/^stream\\s+/i, ''));
+        }
+
+        function buildCardTitle(card, item, textLines) {
+          return firstNormalizedString([
+            item?.title,
+            item?.name,
+            item?.displayName,
+            item?.meetingTitle,
+            item?.subject,
+            item?.fileName,
+            stripStreamPrefix(card.getAttribute('aria-label') || ''),
+            textLines[0],
+          ]);
+        }
+
+        function buildCardSubtitle(item, textLines, title) {
+          const structuredSubtitle = firstNormalizedString([
+            item?.sharedBy,
+            item?.sharedByName,
+            item?.createdBy,
+            item?.createdByName,
+            item?.ownerName,
+            item?.description,
+          ]);
+          if (structuredSubtitle) {
+            return structuredSubtitle;
+          }
+
+          const normalizedTitle = normalizeText(title).toLowerCase();
+          const remainingLines = textLines.filter((line) => {
+            const normalizedLine = normalizeText(line).toLowerCase();
+            return normalizedLine && normalizedLine !== normalizedTitle;
+          });
+          return remainingLines.slice(0, 2).join(' · ');
+        }
+
+        function isMeetingRecordingItem(item, urlCandidates) {
+          const extension = firstNormalizedString([
+            item?.extension,
+            item?.fileExtension,
+            item?.file_extension,
+          ]).toLowerCase();
+          const itemType = firstNormalizedString([item?.type]).toLowerCase();
+          const fileType = firstNormalizedString([
+            item?.fileType,
+            item?.file_type,
+            item?.app,
+          ]).toLowerCase();
+          const isMeetingRecording = normalizeBoolean(
+            item?.isMeetingRecording ?? item?.is_meeting_recording ?? '',
+          );
+
+          if (isMeetingRecording) {
+            return true;
+          }
+
+          if (['mp4', 'm4v', 'mov', 'webm'].includes(extension)) {
+            return true;
+          }
+
+          if (itemType === 'video' || fileType === 'stream') {
+            return true;
+          }
+
+          return urlCandidates.some((href) => isLikelyMeetingHref(href));
+        }
+
+        function findRenderedCardsRoot() {
+          return (
+            document.querySelector('[class*="BaseEdgeworthControl-module__cards__"]') ||
+            document.querySelector('[class*="cards__"]') ||
+            null
+          );
+        }
+
+        function getRenderedCards(container) {
+          const primaryCards = [
+            ...container.querySelectorAll('.fui-Card[role="group"]'),
+          ].filter(isVisible);
+
+          if (primaryCards.length > 0) {
+            return primaryCards;
+          }
+
+          return [...container.querySelectorAll('.fui-Card')].filter((card) => {
+            if (!isVisible(card)) {
+              return false;
+            }
+
+            const ariaLabel = normalizeText(card.getAttribute('aria-label') || '');
+            return /^stream\\s+/i.test(ariaLabel);
+          });
+        }
+
+        function collectRenderedCardItems(container) {
+          const discovered = [];
+          const seenItems = new Set();
+          const visibleCardTitles = [];
+          const cards = getRenderedCards(container);
+
+          for (const card of cards) {
+            const reactItem = findReactItemForCard(card);
+            const textLines = getTextLines(card);
+            const title = buildCardTitle(card, reactItem || {}, textLines);
+            if (title) {
+              visibleCardTitles.push(title);
+            }
+
+            const urlCandidates = reactItem ? buildCardUrlCandidates(reactItem) : [];
+            const url = pickBestMeetingHref(urlCandidates);
+            if (!url) {
+              continue;
+            }
+
+            if (!isMeetingRecordingItem(reactItem || {}, urlCandidates)) {
+              continue;
+            }
+
+            const identityKey = buildCardIdentityKey(reactItem || {});
+            const dedupeKey = identityKey || url;
+            if (seenItems.has(dedupeKey)) {
+              continue;
+            }
+
+            seenItems.add(dedupeKey);
+            discovered.push({
+              url,
+              title: title || url,
+              subtitle: buildCardSubtitle(reactItem || {}, textLines, title),
+              identityKey,
+              candidateUrls: sortExtractionCandidates(urlCandidates),
+              graphDriveId: buildCardGraphDriveId(reactItem || {}),
+              graphItemId: buildCardGraphItemId(reactItem || {}),
+            });
+          }
+
+          return {
+            items: discovered,
+            visibleCardTitles,
+            visibleCardCount: cards.length,
+          };
+        }
+
+        function collectAnchorItems() {
+          const discovered = [];
+          const seenUrls = new Set();
+          const anchors = [...document.querySelectorAll('a[href]')].filter(isVisible);
+
+          for (const anchor of anchors) {
+            if (!isLikelyMeetingHref(anchor.href)) {
+              continue;
+            }
+
+            const url = normalizeHref(anchor.href);
+            if (!url || seenUrls.has(url)) {
+              continue;
+            }
+
+            const card =
+              anchor.closest('article, li, [role="listitem"], [data-item-index]') ||
+              anchor.parentElement ||
+              anchor;
+            const textLines = String(card?.innerText || anchor.innerText || '')
+              .split(/\\r?\\n/)
+              .map((line) => normalizeText(line))
+              .filter(Boolean);
+            const title =
+              normalizeText(anchor.getAttribute('aria-label')) ||
+              normalizeText(
+                card?.querySelector('[title]')?.getAttribute('title') || '',
+              ) ||
+              normalizeText(anchor.querySelector('img')?.getAttribute('alt') || '') ||
+              textLines[0] ||
+              normalizeText(anchor.textContent);
+            const subtitle = textLines.slice(1, 3).join(' · ');
+
+            discovered.push({
+              url,
+              title,
+              subtitle,
+            });
+            seenUrls.add(url);
+          }
+
+          return discovered;
+        }
+
+        function getScrollMetrics(container) {
+          if (container === document.scrollingElement) {
+            return {
+              top: window.scrollY,
+              height: window.innerHeight,
+              maxTop: Math.max(
+                document.scrollingElement.scrollHeight - window.innerHeight,
+                0,
+              ),
+            };
+          }
+
+          return {
+            top: container.scrollTop,
+            height: container.clientHeight,
+            maxTop: Math.max(container.scrollHeight - container.clientHeight, 0),
+          };
+        }
+
+        function setScrollTop(container, top) {
+          if (container === document.scrollingElement) {
+            window.scrollTo(0, top);
+            return;
+          }
+
+          container.scrollTop = top;
+        }
+
+        function countAnchors(container) {
+          return container.querySelectorAll('a[href]').length;
+        }
+
+        function countVisibleCards(container) {
+          return getRenderedCards(container).length;
+        }
+
+        function findScrollContainer() {
+          const renderedCardsRoot = findRenderedCardsRoot();
+          let current = renderedCardsRoot;
+          while (current) {
+            if (
+              current instanceof HTMLElement &&
+              current.scrollHeight > current.clientHeight + 120
+            ) {
+              return current;
+            }
+
+            current = current.parentElement;
+          }
+
+          const candidates = [
+            document.scrollingElement,
+            ...document.querySelectorAll('main, [role="main"], section, div'),
+          ].filter(
+            (element) =>
+              element instanceof HTMLElement &&
+              element.scrollHeight > element.clientHeight + 120,
+          );
+
+          candidates.sort(
+            (left, right) =>
+              countVisibleCards(right) - countVisibleCards(left) ||
+              countAnchors(right) - countAnchors(left),
+          );
+          return candidates[0] || document.scrollingElement || document.body;
+        }
+
+        const meetingsControl = findMeetingsControl();
+        if (!meetingsControl) {
+          return {
+            error: 'Could not find the Meetings filter in Stream.',
+            items: [],
+            controlLabel: '',
+            selectedBeforeClick: false,
+            scrollIterations: 0,
+          };
+        }
+
+        const controlElement = meetingsControl.element;
+        const selectedBeforeClick = looksActive(controlElement);
+        if (!selectedBeforeClick) {
+          clickElement(controlElement);
+          await wait(settleMs * 2);
+        }
+
+        const container = findScrollContainer();
+        const initialRenderedDiscovery = collectRenderedCardItems(
+          findRenderedCardsRoot() || container,
+        );
+        const visibleCardTitles = [...initialRenderedDiscovery.visibleCardTitles];
+        let stablePasses = 0;
+        let scrollIterations = 0;
+
+        while (scrollIterations < 80 && stablePasses < 4) {
+          const renderedRoot = findRenderedCardsRoot() || container;
+          const beforeRendered = collectRenderedCardItems(renderedRoot);
+          const beforeItems = collectAnchorItems();
+          const beforeSurfaceCount = Math.max(
+            beforeRendered.visibleCardCount,
+            beforeRendered.items.length,
+            beforeItems.length,
+            countAnchors(container),
+            countVisibleCards(container),
+          );
+          const metrics = getScrollMetrics(container);
+          const nextTop = Math.min(
+            metrics.top + Math.max(Math.floor(metrics.height * 0.85), 320),
+            metrics.maxTop,
+          );
+          const moved = nextTop > metrics.top + 4;
+
+          setScrollTop(container, nextTop);
+          await wait(settleMs);
+
+          const afterRendered = collectRenderedCardItems(renderedRoot);
+          const afterItems = collectAnchorItems();
+          visibleCardTitles.length = 0;
+          visibleCardTitles.push(...afterRendered.visibleCardTitles);
+          const afterSurfaceCount = Math.max(
+            afterRendered.visibleCardCount,
+            afterRendered.items.length,
+            afterItems.length,
+            countAnchors(container),
+            countVisibleCards(container),
+          );
+          const noNewItems = afterSurfaceCount <= beforeSurfaceCount;
+          const atBottom = nextTop >= metrics.maxTop - 4;
+
+          if ((!moved && noNewItems) || (atBottom && noNewItems)) {
+            stablePasses += 1;
+          } else {
+            stablePasses = 0;
+          }
+
+          scrollIterations += 1;
+        }
+
+        const renderedRoot = findRenderedCardsRoot() || container;
+        const renderedDiscovery = collectRenderedCardItems(renderedRoot);
+        const anchorItems = collectAnchorItems();
+
+        return {
+          error: '',
+          controlLabel: buildControlLabel(controlElement),
+          selectedBeforeClick,
+          scrollIterations,
+          items: [...renderedDiscovery.items, ...anchorItems],
+          visibleCardCount: renderedDiscovery.visibleCardCount,
+          visibleCardTitles: renderedDiscovery.visibleCardTitles,
+          page: {
+            title: document.title.replace(' - Microsoft Stream', '').trim(),
+            url: location.href,
+          },
+        };
+      })()
+    `;
+  }
+
+  function shouldTrackMeetingDiscoveryResponse(response, resourceType) {
+    const url = String(response?.url || '').toLowerCase();
+    if (!url || !isStreamRelatedUrl(url)) {
+      return false;
+    }
+
+    const resource = String(resourceType || '');
+    if (/Image|Media|Font|Stylesheet/.test(resource)) {
+      return false;
+    }
+
+    const mimeType = String(response?.mimeType || '').toLowerCase();
+    const contentType = String(
+      lowerCaseHeaderMap(response?.headers || {})['content-type'] || '',
+    ).toLowerCase();
+    const contentHint = `${mimeType} ${contentType}`;
+
+    return /json|text|html|xml|javascript/.test(contentHint);
+  }
+
+  async function discoverMeetingPages(
     cdp,
-    prompt,
-    debugEnabled = false,
-    captureControl = 'manual',
+    startUrl,
+    {
+      navigate = true,
+      initialPage = null,
+      waitBeforeDomDiscoveryMs = 0,
+      debugEnabled = false,
+    } = {},
   ) {
     await cdp.send('Network.enable', {
       maxTotalBufferSize: 100_000_000,
       maxResourceBufferSize: 10_000_000,
     });
-  
+    await cdp
+      .send('Network.setCacheDisabled', { cacheDisabled: true })
+      .catch(() => {});
+    await cdp
+      .send('Network.setBypassServiceWorker', { bypass: true })
+      .catch(() => {});
+
+    const eventScope = createCdpEventScope(cdp);
+    const trackedResponses = new Map();
+    const finishedRequests = new Set();
+    const failedRequests = new Set();
+    const bodyCache = new Map();
+    const requestMetadata = new Map();
+    const graphThumbnailCandidates = new Map();
+
+    eventScope.on('Network.requestWillBeSent', (params) => {
+      requestMetadata.set(String(params.requestId), {
+        requestId: String(params.requestId),
+        url: String(params.request?.url || ''),
+        method: String(params.request?.method || ''),
+      });
+    });
+
+    eventScope.on('Network.responseReceived', (params) => {
+      if (
+        trackedResponses.size >= MAX_DEBUG_RESPONSES ||
+        !shouldTrackMeetingDiscoveryResponse(params.response, params.type)
+      ) {
+        return;
+      }
+
+      const requestId = String(params.requestId);
+      trackedResponses.set(requestId, {
+        requestId,
+        url: String(params.response.url || ''),
+        status: params.response.status,
+        mimeType: String(params.response.mimeType || ''),
+        resourceType: String(params.type || ''),
+      });
+    });
+
+    eventScope.on('Network.requestWillBeSentExtraInfo', (params) => {
+      const requestId = String(params.requestId);
+      const request = requestMetadata.get(requestId) || {};
+      const graphTarget = parseGraphThumbnailDriveItem(request.url || '');
+      if (!graphTarget || String(request.method || '').toUpperCase() !== 'GET') {
+        return;
+      }
+
+      const headers = params.headers || {};
+      const authorization = String(
+        headers.authorization || headers.Authorization || '',
+      ).trim();
+      const key = `${graphTarget.driveId}\t${graphTarget.itemId}`;
+      if (!graphThumbnailCandidates.has(key)) {
+        graphThumbnailCandidates.set(key, {
+          ...graphTarget,
+          authorization,
+        });
+        return;
+      }
+
+      const existing = graphThumbnailCandidates.get(key);
+      if (!existing.authorization && authorization) {
+        existing.authorization = authorization;
+      }
+    });
+
+    eventScope.on('Network.loadingFinished', (params) => {
+      finishedRequests.add(String(params.requestId));
+    });
+
+    eventScope.on('Network.loadingFailed', (params) => {
+      failedRequests.add(String(params.requestId));
+    });
+
+    try {
+      const pageSnapshot = navigate
+        ? await navigatePageAndWait(cdp, startUrl)
+        : initialPage ||
+          (await getCurrentPageSnapshot(cdp).catch(() => ({
+            title: '',
+            url: startUrl,
+          })));
+
+      if (waitBeforeDomDiscoveryMs > 0) {
+        await sleep(waitBeforeDomDiscoveryMs);
+      }
+
+      const domDiscovery = await evaluate(
+        cdp,
+        buildMeetingDiscoveryExpression(),
+        DEFAULT_PAGE_NAVIGATION_TIMEOUT_MS * 2,
+      );
+
+      if (domDiscovery?.error) {
+        throw new CliError(domDiscovery.error);
+      }
+
+      eventScope.stopAll();
+
+      const networkItems = [];
+      const debugResponseBodies = [];
+      const bodyTargets = Array.from(trackedResponses.values())
+        .filter(
+          (responseRecord) =>
+            finishedRequests.has(responseRecord.requestId) &&
+            !failedRequests.has(responseRecord.requestId),
+        )
+        .slice(0, MAX_DISCOVERY_RESPONSE_BODIES);
+
+      for (const responseRecord of bodyTargets) {
+        const bodyRecord = await loadResponseBody(
+          cdp,
+          responseRecord.requestId,
+          bodyCache,
+        );
+
+        if (bodyRecord.bodyError || !bodyRecord.body) {
+          if (debugEnabled) {
+            debugResponseBodies.push({
+              ...responseRecord,
+              bodyError: bodyRecord.bodyError,
+              bodyPreview: bodyRecord.bodyPreview,
+              matchedItems: [],
+            });
+          }
+          continue;
+        }
+
+        const extractedItems = extractMeetingDiscoveryItemsFromBody(
+          bodyRecord.body,
+          responseRecord.url,
+        );
+        networkItems.push(...extractedItems);
+
+        if (debugEnabled) {
+          debugResponseBodies.push({
+            ...responseRecord,
+            bodyError: bodyRecord.bodyError,
+            bodyPreview: bodyRecord.bodyPreview,
+            matchedItems: extractedItems,
+          });
+        }
+      }
+
+      const graphResolvedItems = await resolveGraphThumbnailMeetingItems(
+        graphThumbnailCandidates,
+        {
+          visibleTitles: Array.isArray(domDiscovery?.visibleCardTitles)
+            ? domDiscovery.visibleCardTitles
+            : [],
+          existingNetworkItems: networkItems,
+        },
+      );
+      networkItems.push(...graphResolvedItems);
+
+      const domGraphResolvedItems = await resolveDomGraphMeetingItems(
+        Array.isArray(domDiscovery?.items) ? domDiscovery.items : [],
+        {
+          graphThumbnailCandidates,
+          existingNetworkItems: networkItems,
+        },
+      );
+      networkItems.push(...domGraphResolvedItems);
+
+      const mergedItems = mergeDiscoveredMeetingItems(
+        networkItems,
+        Array.isArray(domDiscovery?.items) ? domDiscovery.items : [],
+      );
+
+      const totalGraphResolvedItemCount =
+        graphResolvedItems.length + domGraphResolvedItems.length;
+
+      return {
+        startUrl,
+        page: domDiscovery?.page || pageSnapshot,
+        meetingsControlLabel: String(domDiscovery?.controlLabel || ''),
+        meetingsSelectedBeforeClick: Boolean(domDiscovery?.selectedBeforeClick),
+        scrollIterations:
+          typeof domDiscovery?.scrollIterations === 'number'
+            ? domDiscovery.scrollIterations
+            : 0,
+        trackedResponseCount: trackedResponses.size,
+        networkItemCount: networkItems.length,
+        graphResolvedItemCount: totalGraphResolvedItemCount,
+        graphThumbnailResolvedItemCount: graphResolvedItems.length,
+        domGraphResolvedItemCount: domGraphResolvedItems.length,
+        domItemCount: Array.isArray(domDiscovery?.items)
+          ? domDiscovery.items.length
+          : 0,
+        visibleCardCount:
+          typeof domDiscovery?.visibleCardCount === 'number'
+            ? domDiscovery.visibleCardCount
+            : Array.isArray(domDiscovery?.visibleCardTitles)
+              ? domDiscovery.visibleCardTitles.length
+              : 0,
+        visibleCardTitles: Array.isArray(domDiscovery?.visibleCardTitles)
+          ? domDiscovery.visibleCardTitles
+          : [],
+        items: mergedItems,
+        debug: debugEnabled
+          ? {
+              trackedResponses: Array.from(trackedResponses.values()),
+              responseBodies: debugResponseBodies,
+              graphThumbnailCandidateCount: graphThumbnailCandidates.size,
+              graphResolvedItemCount: totalGraphResolvedItemCount,
+              graphThumbnailResolvedItemCount: graphResolvedItems.length,
+              domGraphResolvedItemCount: domGraphResolvedItems.length,
+            }
+          : null,
+      };
+    } finally {
+      eventScope.stopAll();
+      await cdp
+        .send('Network.setBypassServiceWorker', { bypass: false })
+        .catch(() => {});
+      await cdp
+        .send('Network.setCacheDisabled', { cacheDisabled: false })
+        .catch(() => {});
+      await cdp.send('Network.disable').catch(() => {});
+    }
+  }
+
+  async function refetchBinaryBody(url) {
+    const response = await fetch(url, {
+      redirect: 'follow',
+    });
+
+    if (!response.ok) {
+      throw new Error(`Refetch failed with status ${response.status}.`);
+    }
+
+    const rawBytes = Buffer.from(await response.arrayBuffer());
+    return createResponseBodyRecord(
+      {
+        body: rawBytes.toString('utf8'),
+        bodyError: '',
+        base64Encoded: true,
+        rawBodyBase64: rawBytes.toString('base64'),
+        rawBodyByteLength: rawBytes.length,
+        rawBodyPreviewHex: rawBytes.subarray(0, 32).toString('hex'),
+        refetchedExternally: true,
+        refetchError: '',
+      },
+      { trimForPreview },
+    );
+  }
+
+  async function reloadPageAndWait(cdp, timeoutMs = DEFAULT_CDP_TIMEOUT_MS) {
+    return reloadWithCdp(cdp, {
+      timeoutMs,
+      settleMs: 1_000,
+      errorFactory: (message) => new CliError(message),
+    });
+  }
+
+  async function captureStreamNetwork(
+    cdp,
+    prompt,
+    debugEnabled = false,
+    captureControl = 'manual',
+    { allowManualAssist = true } = {},
+  ) {
+    await cdp.send('Network.enable', {
+      maxTotalBufferSize: 100_000_000,
+      maxResourceBufferSize: 10_000_000,
+    });
+
+    const eventScope = createCdpEventScope(cdp);
     const trackedResponses = new Map();
     const finishedRequests = new Set();
     const failedRequests = new Map();
@@ -6373,17 +8210,17 @@ const runEmbeddedNetworkMode = (() => {
           eventSourceMessages: [],
         }
       : null;
-  
+
     function ensureTrackedWebSocket(requestId, url = '') {
       if (!debugState) {
         return null;
       }
-  
+
       const normalizedRequestId = String(requestId || '');
       if (!normalizedRequestId) {
         return null;
       }
-  
+
       if (debugState.webSockets.has(normalizedRequestId)) {
         const socket = debugState.webSockets.get(normalizedRequestId);
         if (url && !socket.url) {
@@ -6391,7 +8228,7 @@ const runEmbeddedNetworkMode = (() => {
         }
         return socket;
       }
-  
+
       if (
         debugState.webSockets.size >= MAX_DEBUG_WEBSOCKETS ||
         !shouldTrackDebugTraffic({
@@ -6402,7 +8239,7 @@ const runEmbeddedNetworkMode = (() => {
       ) {
         return null;
       }
-  
+
       const socket = {
         requestId: normalizedRequestId,
         url,
@@ -6418,9 +8255,11 @@ const runEmbeddedNetworkMode = (() => {
       debugState.webSockets.set(normalizedRequestId, socket);
       return socket;
     }
-  
-    const stopResponseListener = cdp.on('Network.responseReceived', (params) => {
-      if (shouldTrackNetworkResponse(params.response, params.type)) {
+
+    eventScope.on('Network.responseReceived', (params) => {
+      if (trackedResponses.size >= MAX_TRACKED_RESPONSES) {
+        // Continue recording extended debug traffic even after candidate capture is full.
+      } else if (shouldTrackNetworkResponse(params.response, params.type)) {
         const headers = sanitizeHeaders(params.response.headers);
         const lowerHeaders = lowerCaseHeaderMap(params.response.headers);
         const requestId = String(params.requestId);
@@ -6435,8 +8274,8 @@ const runEmbeddedNetworkMode = (() => {
           contentDisposition: String(lowerHeaders['content-disposition'] || '').toLowerCase(),
           resourceType,
         });
-  
-        retainTrackedResponse(trackedResponses, {
+
+        trackedResponses.set(requestId, {
           requestId,
           url,
           status: params.response.status,
@@ -6444,7 +8283,7 @@ const runEmbeddedNetworkMode = (() => {
           resourceType,
           headers,
           score,
-        }, MAX_TRACKED_RESPONSES);
+        });
         captureFeedback.candidateResponseCount = trackedResponses.size;
 
         if (
@@ -6504,11 +8343,11 @@ const runEmbeddedNetworkMode = (() => {
           }
         }
       }
-  
+
       if (!debugState) {
         return;
       }
-  
+
       const requestId = String(params.requestId);
       const url = String(params.response.url || '');
       const resourceType = String(params.type || '');
@@ -6518,7 +8357,7 @@ const runEmbeddedNetworkMode = (() => {
       ) {
         return;
       }
-  
+
       if (!shouldTrackDebugTraffic({
         url,
         resourceType,
@@ -6527,7 +8366,7 @@ const runEmbeddedNetworkMode = (() => {
       })) {
         return;
       }
-  
+
       const headers = sanitizeHeaders(params.response.headers);
       const lowerHeaders = lowerCaseHeaderMap(params.response.headers);
       const existingResponse = debugState.responses.get(requestId);
@@ -6551,12 +8390,12 @@ const runEmbeddedNetworkMode = (() => {
         protocol: String(params.response.protocol || ''),
       });
     });
-  
-    const stopRequestListener = cdp.on('Network.requestWillBeSent', (params) => {
+
+    eventScope.on('Network.requestWillBeSent', (params) => {
       if (!debugState) {
         return;
       }
-  
+
       const requestId = String(params.requestId);
       const request = params.request || {};
       const url = String(request.url || '');
@@ -6567,7 +8406,7 @@ const runEmbeddedNetworkMode = (() => {
       ) {
         return;
       }
-  
+
       if (
         !shouldTrackDebugTraffic({
           url,
@@ -6580,7 +8419,7 @@ const runEmbeddedNetworkMode = (() => {
       ) {
         return;
       }
-  
+
       debugState.requests.set(requestId, {
         requestId,
         url,
@@ -6608,8 +8447,8 @@ const runEmbeddedNetworkMode = (() => {
         redirectResponseUrl: String(params.redirectResponse?.url || ''),
       });
     });
-  
-    const stopFinishedListener = cdp.on('Network.loadingFinished', (params) => {
+
+    eventScope.on('Network.loadingFinished', (params) => {
       const requestId = String(params.requestId);
       finishedRequests.add(requestId);
       if (transcriptHintRequestIds.has(requestId)) {
@@ -6625,11 +8464,11 @@ const runEmbeddedNetworkMode = (() => {
           );
         }
       }
-  
+
       if (!debugState) {
         return;
       }
-  
+
       const responseRecord = debugState.responses.get(requestId);
       if (responseRecord) {
         responseRecord.finished = true;
@@ -6639,8 +8478,8 @@ const runEmbeddedNetworkMode = (() => {
             : null;
       }
     });
-  
-    const stopFailedListener = cdp.on('Network.loadingFailed', (params) => {
+
+    eventScope.on('Network.loadingFailed', (params) => {
       const requestId = String(params.requestId);
       const errorText = params.errorText || 'Request failed';
       failedRequests.set(requestId, errorText);
@@ -6658,11 +8497,11 @@ const runEmbeddedNetworkMode = (() => {
           );
         }
       }
-  
+
       if (!debugState) {
         return;
       }
-  
+
       const responseRecord = debugState.responses.get(requestId);
       if (responseRecord) {
         responseRecord.loadingFailure = errorText;
@@ -6675,8 +8514,8 @@ const runEmbeddedNetworkMode = (() => {
         resourceType: String(params.type || ''),
       });
     });
-  
-    const stopWebSocketCreatedListener = cdp.on(
+
+    eventScope.on(
       'Network.webSocketCreated',
       (params) => {
         const socket = ensureTrackedWebSocket(
@@ -6686,21 +8525,21 @@ const runEmbeddedNetworkMode = (() => {
         if (!socket) {
           return;
         }
-  
+
         socket.created = true;
         socket.createdAt =
           typeof params.timestamp === 'number' ? params.timestamp : null;
       },
     );
-  
-    const stopWebSocketHandshakeRequestListener = cdp.on(
+
+    eventScope.on(
       'Network.webSocketWillSendHandshakeRequest',
       (params) => {
         const socket = ensureTrackedWebSocket(params.requestId);
         if (!socket) {
           return;
         }
-  
+
         socket.handshakeRequest = {
           timestamp:
             typeof params.timestamp === 'number' ? params.timestamp : null,
@@ -6710,15 +8549,15 @@ const runEmbeddedNetworkMode = (() => {
         };
       },
     );
-  
-    const stopWebSocketHandshakeResponseListener = cdp.on(
+
+    eventScope.on(
       'Network.webSocketHandshakeResponseReceived',
       (params) => {
         const socket = ensureTrackedWebSocket(params.requestId);
         if (!socket) {
           return;
         }
-  
+
         socket.handshakeResponse = {
           timestamp:
             typeof params.timestamp === 'number' ? params.timestamp : null,
@@ -6731,30 +8570,30 @@ const runEmbeddedNetworkMode = (() => {
         };
       },
     );
-  
-    const stopWebSocketFrameReceivedListener = cdp.on(
+
+    eventScope.on(
       'Network.webSocketFrameReceived',
       (params) => {
         if (!debugState) {
           return;
         }
-  
+
         const socket = ensureTrackedWebSocket(params.requestId);
         if (!socket) {
           return;
         }
-  
+
         socket.framesReceived += 1;
         const payload = summarizeWebSocketPayload(
           params.response?.payloadData || '',
         );
         socket.transcriptSignalDetected =
           socket.transcriptSignalDetected || payload.transcriptSignalDetected;
-  
+
         if (debugState.webSocketFrames.length >= MAX_DEBUG_WEBSOCKET_FRAMES) {
           return;
         }
-  
+
         debugState.webSocketFrames.push({
           requestId: String(params.requestId),
           direction: 'received',
@@ -6769,30 +8608,30 @@ const runEmbeddedNetworkMode = (() => {
         });
       },
     );
-  
-    const stopWebSocketFrameSentListener = cdp.on(
+
+    eventScope.on(
       'Network.webSocketFrameSent',
       (params) => {
         if (!debugState) {
           return;
         }
-  
+
         const socket = ensureTrackedWebSocket(params.requestId);
         if (!socket) {
           return;
         }
-  
+
         socket.framesSent += 1;
         const payload = summarizeWebSocketPayload(
           params.response?.payloadData || '',
         );
         socket.transcriptSignalDetected =
           socket.transcriptSignalDetected || payload.transcriptSignalDetected;
-  
+
         if (debugState.webSocketFrames.length >= MAX_DEBUG_WEBSOCKET_FRAMES) {
           return;
         }
-  
+
         debugState.webSocketFrames.push({
           requestId: String(params.requestId),
           direction: 'sent',
@@ -6807,27 +8646,27 @@ const runEmbeddedNetworkMode = (() => {
         });
       },
     );
-  
-    const stopWebSocketClosedListener = cdp.on(
+
+    eventScope.on(
       'Network.webSocketClosed',
       (params) => {
         const socket = ensureTrackedWebSocket(params.requestId);
         if (!socket) {
           return;
         }
-  
+
         socket.closedAt =
           typeof params.timestamp === 'number' ? params.timestamp : null;
       },
     );
-  
-    const stopEventSourceMessageListener = cdp.on(
+
+    eventScope.on(
       'Network.eventSourceMessageReceived',
       (params) => {
         if (!debugState) {
           return;
         }
-  
+
         const requestId = String(params.requestId);
         const requestRecord = debugState.requests.get(requestId);
         const responseRecord = debugState.responses.get(requestId);
@@ -6842,7 +8681,7 @@ const runEmbeddedNetworkMode = (() => {
         ) {
           return;
         }
-  
+
         debugState.eventSourceMessages.push({
           requestId,
           timestamp:
@@ -6857,240 +8696,154 @@ const runEmbeddedNetworkMode = (() => {
         });
       },
     );
-  
-    if (captureControl === 'automatic') {
-      await runAutomaticTranscriptCaptureFlow(
-        cdp,
-        prompt,
-        captureFeedback,
-        debugEnabled,
-      );
-    } else if (debugEnabled) {
-      console.log('Reloading the page with capture armed...');
-      await reloadPageAndWait(cdp);
-      printCaptureInstructions(debugEnabled);
-      await prompt.waitForEnter('\nPress Enter after the transcript panel has loaded...\n');
-      await sleep(DEFAULT_CAPTURE_SETTLE_MS);
-    } else {
-      printCaptureInstructions(debugEnabled);
-      await prompt.waitForEnter('\nPress Enter after the transcript panel has loaded...\n');
-      await sleep(DEFAULT_CAPTURE_SETTLE_MS);
-    }
-  
-    stopRequestListener();
-    stopResponseListener();
-    stopFinishedListener();
-    stopFailedListener();
-    stopWebSocketCreatedListener();
-    stopWebSocketHandshakeRequestListener();
-    stopWebSocketHandshakeResponseListener();
-    stopWebSocketFrameReceivedListener();
-    stopWebSocketFrameSentListener();
-    stopWebSocketClosedListener();
-    stopEventSourceMessageListener();
-  
-    const debugBodyTargets = debugState
-      ? Array.from(debugState.responses.values())
-          .filter(shouldFetchDebugResponseBody)
-          .slice(0, MAX_DEBUG_BODIES)
-      : [];
-    const bodyTargets = new Map();
-  
-    for (const candidate of trackedResponses.values()) {
-      bodyTargets.set(candidate.requestId, {
-        requestId: candidate.requestId,
-        url: candidate.url,
-        status: candidate.status,
-        mimeType: candidate.mimeType,
-        resourceType: candidate.resourceType,
-        contentType: String(
-          lowerCaseHeaderMap(candidate.headers)['content-type'] || '',
-        ),
-        finished: finishedRequests.has(candidate.requestId),
-        loadingFailure: failedRequests.get(candidate.requestId) || '',
-        wasCandidate: true,
-      });
-    }
-  
-    for (const responseRecord of debugBodyTargets) {
-      if (bodyTargets.has(responseRecord.requestId)) {
-        continue;
-      }
-  
-      bodyTargets.set(responseRecord.requestId, {
-        requestId: responseRecord.requestId,
-        url: responseRecord.url,
-        status: responseRecord.status,
-        mimeType: responseRecord.mimeType,
-        resourceType: responseRecord.resourceType,
-        contentType: responseRecord.contentType,
-        finished: responseRecord.finished,
-        loadingFailure: responseRecord.loadingFailure || '',
-        wasCandidate: false,
-      });
-    }
-  
-    const bodyRecordsByRequestId = new Map();
-  
-    for (const target of bodyTargets.values()) {
-      const requestId = target.requestId;
-      const failed = target.loadingFailure || failedRequests.get(requestId) || '';
-      const finished = target.finished || finishedRequests.has(requestId);
-      let bodyRecord;
-  
-      if (finished && !failed) {
-        bodyRecord = await loadResponseBody(cdp, requestId, bodyCache);
-      } else if (failed) {
-        bodyRecord = {
-          body: '',
-          bodyLength: 0,
-          bodyPreview: '',
-          bodyError: failed,
-          base64Encoded: false,
-          rawBodyBase64: '',
-          rawBodyByteLength: 0,
-          rawBodyPreviewHex: '',
-          refetchedExternally: false,
-          refetchError: '',
-        };
-      } else {
-        bodyRecord = {
-          body: '',
-          bodyLength: 0,
-          bodyPreview: '',
-          bodyError: 'Request did not finish before capture ended.',
-          base64Encoded: false,
-          rawBodyBase64: '',
-          rawBodyByteLength: 0,
-          rawBodyPreviewHex: '',
-          refetchedExternally: false,
-          refetchError: '',
-        };
-      }
-  
-      bodyRecordsByRequestId.set(requestId, bodyRecord);
-    }
-  
-    const protectionKeys = buildProtectionKeyMap(
-      Array.from(bodyTargets.values()).map((target) => ({
-        url: target.url,
-        body: bodyRecordsByRequestId.get(target.requestId)?.body || '',
-      })),
-    );
-  
-    for (const target of bodyTargets.values()) {
-      if (!isEncryptedTranscriptUrl(target.url)) {
-        continue;
-      }
-  
-      const existingBodyRecord = bodyRecordsByRequestId.get(target.requestId);
-      if (!existingBodyRecord || existingBodyRecord.bodyError) {
-        continue;
-      }
-  
-      const keyId = getUrlSearchParam(target.url, 'kid');
-      const hasProtectionKey =
-        (keyId && protectionKeys.has(keyId)) || protectionKeys.size === 1;
-      if (!hasProtectionKey) {
-        continue;
-      }
-  
-      if (existingBodyRecord.base64Encoded && existingBodyRecord.rawBodyBase64) {
-        continue;
-      }
-  
-      try {
-        const refetchedBodyRecord = await refetchBinaryBody(target.url);
-        bodyRecordsByRequestId.set(target.requestId, {
-          ...existingBodyRecord,
-          ...refetchedBodyRecord,
-        });
-      } catch (error) {
-        bodyRecordsByRequestId.set(target.requestId, {
-          ...existingBodyRecord,
-          refetchedExternally: false,
-          refetchError:
-            error instanceof Error ? error.message : 'Transcript refetch failed.',
-        });
-      }
-    }
-  
-    const candidates = [];
-  
-    for (const candidate of trackedResponses.values()) {
-      const requestId = candidate.requestId;
-      const bodyRecord = finalizeBodyRecordForResponse(
-        candidate.url,
-        bodyRecordsByRequestId.get(requestId) || {
-          body: '',
-          bodyLength: 0,
-          bodyPreview: '',
-          bodyError: 'Response body was not captured.',
-          base64Encoded: false,
-          rawBodyBase64: '',
-          rawBodyByteLength: 0,
-          rawBodyPreviewHex: '',
-          refetchedExternally: false,
-          refetchError: '',
-        },
-        protectionKeys,
-      );
-      const parsed = summarizeCapturedBody(bodyRecord.body);
-      candidates.push({
-        ...candidate,
-        body: bodyRecord.body,
-        bodyLength: bodyRecord.bodyLength,
-        bodyPreview: bodyRecord.bodyPreview,
-        bodyError: bodyRecord.bodyError,
-        base64Encoded: bodyRecord.base64Encoded,
-        rawBodyBase64: bodyRecord.rawBodyBase64,
-        rawBodyByteLength: bodyRecord.rawBodyByteLength,
-        rawBodyPreviewHex: bodyRecord.rawBodyPreviewHex,
-        refetchedExternally: bodyRecord.refetchedExternally,
-        refetchError: bodyRecord.refetchError,
-        decrypted: bodyRecord.decrypted,
-        decryptionKeyId: bodyRecord.decryptionKeyId,
-        decryptionError: bodyRecord.decryptionError,
-        parsedFormat: parsed.format,
-        parsedPath: parsed.path,
-        parsedEntryCount: parsed.entryCount,
-        parsedEntries: parsed.entries,
-      });
-    }
-  
-    let debug = null;
-  
-    if (debugState) {
-      const debugBodies = [];
-  
-      for (const responseRecord of debugBodyTargets) {
-        const bodyRecord = finalizeBodyRecordForResponse(
-          responseRecord.url,
-          bodyRecordsByRequestId.get(responseRecord.requestId) || {
-            body: '',
-            bodyLength: 0,
-            bodyPreview: '',
-            bodyError: 'Response body was not captured.',
-            base64Encoded: false,
-            rawBodyBase64: '',
-            rawBodyByteLength: 0,
-            rawBodyPreviewHex: '',
-            refetchedExternally: false,
-            refetchError: '',
+
+    try {
+      if (captureControl === 'automatic') {
+        await runAutomaticTranscriptCaptureFlow(
+          cdp,
+          prompt,
+          captureFeedback,
+          debugEnabled,
+          {
+            allowManualAssist,
           },
-          protectionKeys,
         );
-        const parsed = summarizeCapturedBody(bodyRecord.body);
-        debugBodies.push({
+      } else if (debugEnabled) {
+        console.log('Reloading the page with capture armed...');
+        await reloadPageAndWait(cdp);
+        printCaptureInstructions(debugEnabled);
+        await prompt.waitForEnter('\nPress Enter after the transcript panel has loaded...\n');
+        await sleep(DEFAULT_CAPTURE_SETTLE_MS);
+      } else {
+        printCaptureInstructions(debugEnabled);
+        await prompt.waitForEnter('\nPress Enter after the transcript panel has loaded...\n');
+        await sleep(DEFAULT_CAPTURE_SETTLE_MS);
+      }
+
+      eventScope.stopAll();
+
+      const debugBodyTargets = debugState
+        ? Array.from(debugState.responses.values())
+            .filter(shouldFetchDebugResponseBody)
+            .slice(0, MAX_DEBUG_BODIES)
+        : [];
+      const bodyTargets = new Map();
+
+      for (const candidate of trackedResponses.values()) {
+        bodyTargets.set(candidate.requestId, {
+          requestId: candidate.requestId,
+          url: candidate.url,
+          status: candidate.status,
+          mimeType: candidate.mimeType,
+          resourceType: candidate.resourceType,
+          contentType: String(
+            lowerCaseHeaderMap(candidate.headers)['content-type'] || '',
+          ),
+          finished: finishedRequests.has(candidate.requestId),
+          loadingFailure: failedRequests.get(candidate.requestId) || '',
+          wasCandidate: true,
+        });
+      }
+
+      for (const responseRecord of debugBodyTargets) {
+        if (bodyTargets.has(responseRecord.requestId)) {
+          continue;
+        }
+
+        bodyTargets.set(responseRecord.requestId, {
           requestId: responseRecord.requestId,
           url: responseRecord.url,
           status: responseRecord.status,
           mimeType: responseRecord.mimeType,
-          contentType: responseRecord.contentType,
           resourceType: responseRecord.resourceType,
+          contentType: responseRecord.contentType,
+          finished: responseRecord.finished,
+          loadingFailure: responseRecord.loadingFailure || '',
+          wasCandidate: false,
+        });
+      }
+
+      const bodyRecordsByRequestId = new Map();
+
+      for (const target of bodyTargets.values()) {
+        const requestId = target.requestId;
+        const failed = target.loadingFailure || failedRequests.get(requestId) || '';
+        const finished = target.finished || finishedRequests.has(requestId);
+        let bodyRecord;
+
+        if (finished && !failed) {
+          bodyRecord = await loadResponseBody(cdp, requestId, bodyCache);
+        } else if (failed) {
+          bodyRecord = createEmptyResponseBodyRecord(failed);
+        } else {
+          bodyRecord = createEmptyResponseBodyRecord(
+            'Request did not finish before capture ended.',
+          );
+        }
+
+        bodyRecordsByRequestId.set(requestId, bodyRecord);
+      }
+
+      const protectionKeys = buildProtectionKeyMap(
+        Array.from(bodyTargets.values()).map((target) => ({
+          url: target.url,
+          body: bodyRecordsByRequestId.get(target.requestId)?.body || '',
+        })),
+      );
+
+      for (const target of bodyTargets.values()) {
+        if (!isEncryptedTranscriptUrl(target.url)) {
+          continue;
+        }
+
+        const existingBodyRecord = bodyRecordsByRequestId.get(target.requestId);
+        if (!existingBodyRecord || existingBodyRecord.bodyError) {
+          continue;
+        }
+
+        const keyId = getUrlSearchParam(target.url, 'kid');
+        const hasProtectionKey =
+          (keyId && protectionKeys.has(keyId)) || protectionKeys.size === 1;
+        if (!hasProtectionKey) {
+          continue;
+        }
+
+        if (existingBodyRecord.base64Encoded && existingBodyRecord.rawBodyBase64) {
+          continue;
+        }
+
+        try {
+          const refetchedBodyRecord = await refetchBinaryBody(target.url);
+          bodyRecordsByRequestId.set(target.requestId, {
+            ...existingBodyRecord,
+            ...refetchedBodyRecord,
+          });
+        } catch (error) {
+          bodyRecordsByRequestId.set(target.requestId, {
+            ...existingBodyRecord,
+            refetchedExternally: false,
+            refetchError:
+              error instanceof Error ? error.message : 'Transcript refetch failed.',
+          });
+        }
+      }
+
+      const candidates = [];
+
+      for (const candidate of trackedResponses.values()) {
+        const requestId = candidate.requestId;
+        const bodyRecord = finalizeBodyRecordForResponse(
+          candidate.url,
+          bodyRecordsByRequestId.get(requestId) ||
+            createEmptyResponseBodyRecord('Response body was not captured.'),
+          protectionKeys,
+        );
+        const parsed = summarizeCapturedBody(bodyRecord.body);
+        candidates.push({
+          ...candidate,
+          body: bodyRecord.body,
           bodyLength: bodyRecord.bodyLength,
           bodyPreview: bodyRecord.bodyPreview,
-          body: bodyRecord.body,
           bodyError: bodyRecord.bodyError,
           base64Encoded: bodyRecord.base64Encoded,
           rawBodyBase64: bodyRecord.rawBodyBase64,
@@ -7104,70 +8857,117 @@ const runEmbeddedNetworkMode = (() => {
           parsedFormat: parsed.format,
           parsedPath: parsed.path,
           parsedEntryCount: parsed.entryCount,
-          parsedEntrySample: parsed.entries.slice(0, 5),
-          wasCandidate: trackedResponses.has(responseRecord.requestId),
+          parsedEntries: parsed.entries,
         });
       }
-  
-      debug = {
-        requestCount: debugState.requests.size,
-        responseCount: debugState.responses.size,
-        failureCount: debugState.failures.length,
-        webSocketCount: debugState.webSockets.size,
-        webSocketFrameCount: debugState.webSocketFrames.length,
-        eventSourceMessageCount: debugState.eventSourceMessages.length,
-        protectionKeys: Array.from(protectionKeys.values()).map((key) => ({
-          kid: key.kid,
-          sourceUrl: key.sourceUrl,
-          encryptionAlgorithm: key.encryptionAlgorithm,
-          encryptionMode: key.encryptionMode,
-          keySize: key.keySize,
-          padding: key.padding,
-        })),
-        requests: Array.from(debugState.requests.values()),
-        responses: Array.from(debugState.responses.values()),
-        failures: debugState.failures,
-        responseBodies: debugBodies,
-        webSockets: Array.from(debugState.webSockets.values()),
-        webSocketFrames: debugState.webSocketFrames,
-        eventSourceMessages: debugState.eventSourceMessages,
-      };
-    }
-  
-    await cdp.send('Network.disable');
-  
-    candidates.sort((left, right) => {
-      if (right.parsedEntryCount !== left.parsedEntryCount) {
-        return right.parsedEntryCount - left.parsedEntryCount;
-      }
-  
-      return right.score - left.score;
-    });
 
-    const transcriptMatches = candidates.filter(
-      (candidate) => candidate.parsedEntryCount > 0,
-    );
-  
-    const matchedCandidate =
-      transcriptMatches[0] || null;
-  
-    return {
-      candidates,
-      matchedCandidate,
-      transcriptMatchCount: transcriptMatches.length,
-      captureFeedback: {
-        candidateResponseCount: captureFeedback.candidateResponseCount,
-        transcriptHintCount: captureFeedback.transcriptHintCount,
-        transcriptHintSettledCount: captureFeedback.transcriptHintSettledCount,
-        transcriptHintFailedCount: captureFeedback.transcriptHintFailedCount,
-        firstTranscriptHint: captureFeedback.firstTranscriptHint,
-        automaticActions:
-          captureFeedback.automaticActions.slice(0, 200),
-      },
-      debug,
-    };
+      let debug = null;
+
+      if (debugState) {
+        const debugBodies = [];
+
+        for (const responseRecord of debugBodyTargets) {
+          const bodyRecord = finalizeBodyRecordForResponse(
+            responseRecord.url,
+            bodyRecordsByRequestId.get(responseRecord.requestId) ||
+              createEmptyResponseBodyRecord('Response body was not captured.'),
+            protectionKeys,
+          );
+          const parsed = summarizeCapturedBody(bodyRecord.body);
+          debugBodies.push({
+            requestId: responseRecord.requestId,
+            url: responseRecord.url,
+            status: responseRecord.status,
+            mimeType: responseRecord.mimeType,
+            contentType: responseRecord.contentType,
+            resourceType: responseRecord.resourceType,
+            bodyLength: bodyRecord.bodyLength,
+            bodyPreview: bodyRecord.bodyPreview,
+            body: bodyRecord.body,
+            bodyError: bodyRecord.bodyError,
+            base64Encoded: bodyRecord.base64Encoded,
+            rawBodyBase64: bodyRecord.rawBodyBase64,
+            rawBodyByteLength: bodyRecord.rawBodyByteLength,
+            rawBodyPreviewHex: bodyRecord.rawBodyPreviewHex,
+            refetchedExternally: bodyRecord.refetchedExternally,
+            refetchError: bodyRecord.refetchError,
+            decrypted: bodyRecord.decrypted,
+            decryptionKeyId: bodyRecord.decryptionKeyId,
+            decryptionError: bodyRecord.decryptionError,
+            parsedFormat: parsed.format,
+            parsedPath: parsed.path,
+            parsedEntryCount: parsed.entryCount,
+            parsedEntrySample: parsed.entries.slice(0, 5),
+            wasCandidate: trackedResponses.has(responseRecord.requestId),
+          });
+        }
+
+        debug = {
+          requestCount: debugState.requests.size,
+          responseCount: debugState.responses.size,
+          failureCount: debugState.failures.length,
+          webSocketCount: debugState.webSockets.size,
+          webSocketFrameCount: debugState.webSocketFrames.length,
+          eventSourceMessageCount: debugState.eventSourceMessages.length,
+          protectionKeys: Array.from(protectionKeys.values()).map((key) => ({
+            kid: key.kid,
+            sourceUrl: key.sourceUrl,
+            encryptionAlgorithm: key.encryptionAlgorithm,
+            encryptionMode: key.encryptionMode,
+            keySize: key.keySize,
+            padding: key.padding,
+          })),
+          requests: Array.from(debugState.requests.values()),
+          responses: Array.from(debugState.responses.values()),
+          failures: debugState.failures,
+          responseBodies: debugBodies,
+          webSockets: Array.from(debugState.webSockets.values()),
+          webSocketFrames: debugState.webSocketFrames,
+          eventSourceMessages: debugState.eventSourceMessages,
+        };
+      }
+
+      candidates.sort((left, right) => {
+        const scoreDelta =
+          scoreTranscriptCandidate(right) - scoreTranscriptCandidate(left);
+        if (scoreDelta !== 0) {
+          return scoreDelta;
+        }
+
+        if (right.parsedEntryCount !== left.parsedEntryCount) {
+          return right.parsedEntryCount - left.parsedEntryCount;
+        }
+
+        return right.score - left.score;
+      });
+
+      const transcriptMatches = candidates.filter(
+        (candidate) => isUsableTranscriptCandidate(candidate),
+      );
+
+      const matchedCandidate = transcriptMatches[0] || null;
+
+      return {
+        candidates,
+        matchedCandidate,
+        transcriptMatchCount: transcriptMatches.length,
+        captureFeedback: {
+          candidateResponseCount: captureFeedback.candidateResponseCount,
+          transcriptHintCount: captureFeedback.transcriptHintCount,
+          transcriptHintSettledCount: captureFeedback.transcriptHintSettledCount,
+          transcriptHintFailedCount: captureFeedback.transcriptHintFailedCount,
+          firstTranscriptHint: captureFeedback.firstTranscriptHint,
+          automaticActions:
+            captureFeedback.automaticActions.slice(0, 200),
+        },
+        debug,
+      };
+    } finally {
+      eventScope.stopAll();
+      await cdp.send('Network.disable').catch(() => {});
+    }
   }
-  
+
   function buildNetworkCapturePayload({
     options,
     browser,
@@ -7177,10 +8977,10 @@ const runEmbeddedNetworkMode = (() => {
     captureResult,
   }) {
     const visibleCandidates = captureResult.candidates.slice(0, MAX_SAVED_CANDIDATES);
-  
+
     return {
       app: {
-        name: APP_NAME,
+        name: 'Stream Transcript Extractor',
         version: BUILD_VERSION,
         buildTime: BUILD_TIME,
         platform: CURRENT_PLATFORM,
@@ -7284,62 +9084,445 @@ const runEmbeddedNetworkMode = (() => {
     const transcriptHintCount =
       captureResult.captureFeedback?.transcriptHintCount || 0;
 
-    let guidance = 'No transcript data was captured after listening started.';
+    let guidance =
+      'No transcript payload was observed after network capture started.';
 
     if (candidateResponseCount === 0) {
       guidance +=
-        ' No transcript-related responses were captured while this terminal was listening.';
+        ' No transcript-related network responses were captured while the terminal was armed.';
     } else if (transcriptHintCount === 0) {
       guidance +=
         ' Some Stream responses were captured, but none looked transcript-specific.';
     } else {
       guidance +=
-        ' Transcript data was detected, but none of the captured responses parsed into transcript entries.';
+        ' Transcript-like traffic was detected, but none of the captured bodies parsed into transcript entries.';
     }
 
     if (debugEnabled) {
-      return `${guidance} Review the saved diagnostic capture (.network.json).`;
+      return `${guidance} Review the saved .network.json capture.`;
     }
 
     if (captureControl === 'automatic') {
       return (
-        `${guidance} Rerun with --debug to save a diagnostic capture ` +
-        '(.network.json) and print the automatic action trace.'
+        `${guidance} Rerun with --debug to save a .network.json capture and ` +
+        'print the automatic action trace.'
       );
     }
 
     return (
-      `${guidance} Rerun with --debug to save a diagnostic capture ` +
-      '(.network.json) and auto-reload the page after capture starts.'
+      `${guidance} Rerun with --debug to save a .network.json capture and ` +
+      'auto-reload the page once capture is armed.'
     );
   }
-  
+
+  function buildFallbackMeetingMetadata(targetPage) {
+    return {
+      title: targetPage?.title || '',
+      date: '',
+      recordedBy: '',
+      sourceUrl: targetPage?.url || '',
+      createdBy: '',
+      createdByEmail: '',
+      createdByTenantId: '',
+      sourceApplication: '',
+      recordingStartDateTime: '',
+      recordingEndDateTime: '',
+      sharePointFilePath: '',
+      sharePointItemUrl: '',
+    };
+  }
+
+  function attachCliErrorDetails(error, details) {
+    if (error && typeof error === 'object') {
+      error.details = {
+        ...(error.details || {}),
+        ...details,
+      };
+    }
+
+    return error;
+  }
+
+  function buildDiscoveredMeetingLabel(item) {
+    const title = trimForTerminal(item?.title || item?.url || 'Untitled meeting', 56);
+    const subtitle = trimForTerminal(item?.subtitle || '', 40);
+    const progress = getCrawlerItemProgress(item);
+    const progressParts = [
+      progress,
+      item?.seenInCurrentDiscovery ? 'seen now' : 'saved only',
+    ];
+    if (Number(item?.attemptCount || 0) > 0) {
+      progressParts.push(`${item.attemptCount}x`);
+    }
+    if (Number(item?.lastEntryCount || 0) > 0 && progress === 'done') {
+      progressParts.push(`${item.lastEntryCount} entries`);
+    }
+    const sourceLabel =
+      Array.isArray(item?.sources) && item.sources.length > 0
+        ? item.sources.join('+')
+        : 'unknown';
+    const progressLabel = progressParts.join(', ');
+
+    return subtitle
+      ? `${title} | ${progressLabel} | ${subtitle} | ${sourceLabel}`
+      : `${title} | ${progressLabel} | ${sourceLabel}`;
+  }
+
+  function filterCrawlerSelectionIndexes(items, predicate, emptyMessage) {
+    const indexes = [];
+
+    for (let index = 0; index < items.length; index += 1) {
+      if (predicate(items[index], index)) {
+        indexes.push(index);
+      }
+    }
+
+    if (indexes.length === 0) {
+      throw new CliError(emptyMessage);
+    }
+
+    return indexes;
+  }
+
+  function resolveCrawlerSelectionIndexes(answer, items) {
+    const normalizedAnswer = String(answer || '').trim().toLowerCase();
+
+    if (!normalizedAnswer || normalizedAnswer === 'pending') {
+      return filterCrawlerSelectionIndexes(
+        items,
+        (item) => getCrawlerItemProgress(item) !== 'done',
+        'No pending, new, or failed items are queued. Enter all, done, or a numeric selection.',
+      );
+    }
+
+    if (normalizedAnswer === 'new') {
+      return filterCrawlerSelectionIndexes(
+        items,
+        (item) => getCrawlerItemProgress(item) === 'new',
+        'No new items were discovered in this run.',
+      );
+    }
+
+    if (normalizedAnswer === 'failed') {
+      return filterCrawlerSelectionIndexes(
+        items,
+        (item) => getCrawlerItemProgress(item) === 'failed',
+        'No failed items are recorded in the crawl state.',
+      );
+    }
+
+    if (
+      normalizedAnswer === 'done' ||
+      normalizedAnswer === 'completed' ||
+      normalizedAnswer === 'success'
+    ) {
+      return filterCrawlerSelectionIndexes(
+        items,
+        (item) => getCrawlerItemProgress(item) === 'done',
+        'No completed items are recorded in the crawl state.',
+      );
+    }
+
+    if (normalizedAnswer === 'all') {
+      return items.map((_item, index) => index);
+    }
+
+    return parseSelectionSpec(answer, items.length);
+  }
+
+  function updateCrawlerStateItem(item, patch) {
+    Object.assign(item, patch);
+    return item;
+  }
+
+  function buildBatchStatusPayload({
+    options,
+    browser,
+    profile,
+    discovery,
+    results,
+    startedAt,
+    completedAt,
+    stateFilePath,
+    stateSummary,
+  }) {
+    return {
+      app: {
+        name: 'Stream Transcript Extractor',
+        version: BUILD_VERSION,
+        buildTime: BUILD_TIME,
+        platform: CURRENT_PLATFORM,
+      },
+      startedAt,
+      completedAt,
+      options: {
+        startUrl: options.startUrl,
+        outputDir: resolveOutputDirectory(options.outputDir),
+        outputFormat: options.outputFormat,
+        debug: options.debug,
+        stateFilePath,
+      },
+      browser: {
+        key: browser.key,
+        name: browser.name,
+      },
+      profile: {
+        dirName: profile.dirName,
+        displayName: profile.displayName,
+        email: profile.email,
+      },
+      discovery: {
+        page: discovery.page,
+        meetingsControlLabel: discovery.meetingsControlLabel,
+        meetingsSelectedBeforeClick: discovery.meetingsSelectedBeforeClick,
+        scrollIterations: discovery.scrollIterations,
+        trackedResponseCount: discovery.trackedResponseCount,
+        networkItemCount: discovery.networkItemCount,
+        graphResolvedItemCount: discovery.graphResolvedItemCount || 0,
+        graphThumbnailResolvedItemCount:
+          discovery.graphThumbnailResolvedItemCount || 0,
+        domGraphResolvedItemCount: discovery.domGraphResolvedItemCount || 0,
+        domItemCount: discovery.domItemCount,
+        visibleCardCount:
+          typeof discovery.visibleCardCount === 'number'
+            ? discovery.visibleCardCount
+            : Array.isArray(discovery.visibleCardTitles)
+              ? discovery.visibleCardTitles.length
+              : 0,
+        visibleCardTitles: discovery.visibleCardTitles || [],
+        discoveredItemCount: discovery.items.length,
+        items: discovery.items,
+      },
+      stateSummary,
+      selectedItemCount: results.length,
+      results,
+    };
+  }
+
+  function buildCrawlerDiscoveryDebugPayload({
+    options,
+    browser,
+    profile,
+    discovery,
+    stateFilePath,
+    discoveredAt,
+  }) {
+    return {
+      app: {
+        name: 'Stream Transcript Extractor',
+        version: BUILD_VERSION,
+        buildTime: BUILD_TIME,
+        platform: CURRENT_PLATFORM,
+      },
+      discoveredAt,
+      stateFilePath,
+      options: {
+        startUrl: options.startUrl,
+        outputDir: resolveOutputDirectory(options.outputDir),
+        outputFormat: options.outputFormat,
+        debug: options.debug,
+      },
+      browser: {
+        key: browser.key,
+        name: browser.name,
+      },
+      profile: {
+        dirName: profile.dirName,
+        displayName: profile.displayName,
+        email: profile.email,
+      },
+      discovery: {
+        page: discovery.page,
+        meetingsControlLabel: discovery.meetingsControlLabel,
+        meetingsSelectedBeforeClick: discovery.meetingsSelectedBeforeClick,
+        scrollIterations: discovery.scrollIterations,
+        trackedResponseCount: discovery.trackedResponseCount,
+        networkItemCount: discovery.networkItemCount,
+        graphResolvedItemCount: discovery.graphResolvedItemCount || 0,
+        graphThumbnailResolvedItemCount:
+          discovery.graphThumbnailResolvedItemCount || 0,
+        domGraphResolvedItemCount: discovery.domGraphResolvedItemCount || 0,
+        domItemCount: discovery.domItemCount,
+        visibleCardCount:
+          typeof discovery.visibleCardCount === 'number'
+            ? discovery.visibleCardCount
+            : Array.isArray(discovery.visibleCardTitles)
+              ? discovery.visibleCardTitles.length
+              : 0,
+        visibleCardTitles: discovery.visibleCardTitles || [],
+        discoveredItemCount: discovery.items.length,
+        items: discovery.items,
+        debug: discovery.debug || null,
+      },
+    };
+  }
+
+  async function extractTranscriptFromConnectedPage({
+    cdp,
+    prompt,
+    options,
+    browser,
+    profile,
+    debugPort,
+    targetPage,
+    captureControl = 'manual',
+    allowManualAssist = true,
+  }) {
+    await cdp.send('Runtime.enable');
+
+    console.log(
+      captureControl === 'automatic'
+        ? 'Capturing transcript-related network responses in automatic mode...'
+        : 'Capturing transcript-related network responses...',
+    );
+    if (options.debug) {
+      console.log(
+        'Debug capture enabled: saving request/response lifecycle data, ' +
+          'candidate bodies, and WebSocket frames.',
+      );
+    }
+
+    const captureResult = await captureStreamNetwork(
+      cdp,
+      prompt,
+      options.debug,
+      captureControl,
+      {
+        allowManualAssist,
+      },
+    );
+    const pageMetadata = await extractMeetingMetadata(cdp).catch(() =>
+      buildFallbackMeetingMetadata(targetPage),
+    );
+    const captureMetadata = extractMeetingMetadataFromCapture(captureResult);
+    const metadata = mergeMeetingMetadata(
+      pageMetadata,
+      captureMetadata,
+      targetPage,
+    );
+    const outputBasePath = buildOutputBasePath(
+      metadata.title || targetPage?.title || 'meeting',
+      options.outputName,
+      options.outputDir,
+    );
+    let networkOutputPath = '';
+
+    console.log(
+      `Observed ${captureResult.candidates.length} potentially relevant network response` +
+        `${captureResult.candidates.length === 1 ? '' : 's'}.`,
+    );
+    console.log(
+      `Parsed ${captureResult.transcriptMatchCount || 0} transcript payload match` +
+        `${captureResult.transcriptMatchCount === 1 ? '' : 'es'}.`,
+    );
+
+    if (!captureResult.matchedCandidate) {
+      if (options.debug) {
+        const networkCapturePayload = buildNetworkCapturePayload({
+          options,
+          browser,
+          profile,
+          debugPort,
+          targetPage,
+          captureResult,
+        });
+        networkOutputPath = saveNetworkCaptureOutput(
+          networkCapturePayload,
+          outputBasePath,
+        );
+        console.log(`Saved network capture to: ${networkOutputPath}`);
+      }
+
+      throw attachCliErrorDetails(
+        new CliError(
+          buildMissingTranscriptCaptureMessage(
+            captureResult,
+            options.debug,
+            captureControl,
+          ),
+        ),
+        {
+          networkOutputPath,
+          outputBasePath,
+        },
+      );
+    }
+
+    if (options.debug) {
+      const networkCapturePayload = buildNetworkCapturePayload({
+        options,
+        browser,
+        profile,
+        debugPort,
+        targetPage,
+        captureResult,
+      });
+      networkOutputPath = saveNetworkCaptureOutput(
+        networkCapturePayload,
+        outputBasePath,
+      );
+    }
+
+    const entries = captureResult.matchedCandidate.parsedEntries;
+    const outputPayload = buildOutputPayload(metadata, entries);
+    const outputPaths = saveOutputs(
+      outputPayload,
+      outputBasePath,
+      options.outputFormat,
+    );
+
+    console.log(
+      `Matched transcript payload: ${captureResult.matchedCandidate.url}`,
+    );
+    console.log(`Parsed ${entries.length} transcript entries.`);
+    for (const outputPath of outputPaths) {
+      console.log(`Saved transcript to: ${outputPath}`);
+    }
+    if (networkOutputPath) {
+      console.log(`Saved network capture to: ${networkOutputPath}`);
+    }
+
+    return {
+      metadata,
+      outputPayload,
+      outputBasePath,
+      outputPaths,
+      networkOutputPath,
+      matchedCandidateUrl: captureResult.matchedCandidate.url,
+      entryCount: entries.length,
+      captureSummary: {
+        candidateResponseCount: captureResult.candidates.length,
+        transcriptMatchCount: captureResult.transcriptMatchCount || 0,
+      },
+    };
+  }
+
   function handleError(error) {
     if (error instanceof CliError) {
       console.error(`\nError: ${error.message}`);
       return error.exitCode;
     }
-  
+
     console.error('\nUnexpected error:');
     console.error(error);
     return 1;
   }
-  
+
   async function run(captureControl = 'manual') {
     const options = parseArgs(process.argv.slice(2));
-  
+
     if (options.help) {
       printHelp();
       return 0;
     }
-  
+
     if (options.version) {
       printVersion();
       return 0;
     }
-  
+
     ensureSupportedPlatform();
-  
+
     const prompt = createPrompt();
     let browserProcess = null;
     let cdp = null;
@@ -7348,182 +9531,61 @@ const runEmbeddedNetworkMode = (() => {
     let profile = null;
     let debugPort = null;
     let targetPage = null;
-    let shouldContinue = true;
-    let hasCompletedExtraction = false;
-  
+
     try {
       ({ browser, profile } = await selectBrowserAndProfile(options, prompt));
       debugPort = await findAvailablePort(options.debugPort);
-  
+
       console.log(`\nUsing ${browser.name} / "${profile.displayName}".`);
       await ensureBrowserIsClosed(prompt, browser);
-  
+
       tempDataDir = join(tmpdir(), `stream-transcript-extractor-network-${Date.now()}`);
       mkdirSync(tempDataDir, { recursive: true });
-  
-      console.log('Setting up a temporary browser session...');
+
+      console.log('Preparing temporary browser profile...');
       prepareTempProfile(browser.basePath, profile, tempDataDir);
 
-      console.log(`Starting ${browser.name}...`);
+      console.log(`Launching ${browser.name} on debug port ${debugPort}...`);
       browserProcess = launchBrowser(browser, profile, tempDataDir, debugPort);
 
-      console.log('Waiting for the browser window to finish opening...');
+      console.log('Waiting for the browser debug endpoint...');
       await waitForBrowserDebugEndpoint(debugPort);
       await waitForBrowserPageTarget(debugPort);
 
-      while (shouldContinue) {
-        if (!hasCompletedExtraction) {
-          printInitialRunInstructions(captureControl);
-          await prompt.waitForEnter(
-            captureControl === 'automatic'
-              ? '\nPress Enter once the Stream meeting page is open and fully rendered...\n'
-              : '\nPress Enter once the Stream meeting page is open and ready...\n',
-          );
-        } else {
-          shouldContinue = await promptForNextExtraction(prompt, captureControl);
-          if (!shouldContinue) {
-            break;
-          }
-        }
+      printInitialRunInstructions(captureControl);
+      await prompt.waitForEnter(
+        '\nPress Enter once the Stream meeting page is open and ready...\n',
+      );
 
-        targetPage = await selectTranscriptPage(prompt, debugPort);
-        console.log(`\nUsing tab: ${targetPage.title}`);
+      targetPage = await selectTranscriptPage(prompt, debugPort);
+      console.log(`\nConnecting to: ${targetPage.title}`);
 
-        cdp = await connectToPage(targetPage.webSocketDebuggerUrl);
-        await cdp.send('Runtime.enable');
-
-        console.log(
-          captureControl === 'automatic'
-            ? 'Listening for transcript data in automatic mode...'
-            : 'Listening for transcript data...',
-        );
-        if (options.debug) {
-          console.log(
-            'Debug capture is on. Extra diagnostic files will be saved for troubleshooting.',
-          );
-        }
-        const captureResult = await captureStreamNetwork(
-          cdp,
-          prompt,
-          options.debug,
-          captureControl,
-        );
-        const pageMetadata = await extractMeetingMetadata(cdp).catch(() => ({
-          title: targetPage?.title || '',
-          date: '',
-          recordedBy: '',
-          sourceUrl: targetPage?.url || '',
-          createdBy: '',
-          createdByEmail: '',
-          createdByTenantId: '',
-          sourceApplication: '',
-          recordingStartDateTime: '',
-          recordingEndDateTime: '',
-          sharePointFilePath: '',
-          sharePointItemUrl: '',
-        }));
-        const captureMetadata = extractMeetingMetadataFromCapture(captureResult);
-        const metadata = mergeMeetingMetadata(
-          pageMetadata,
-          captureMetadata,
-          targetPage,
-        );
-        const outputBasePath = buildOutputBasePath(
-          metadata.title || targetPage?.title || 'meeting',
-          options.outputName,
-          options.outputDir,
-        );
-        let networkOutputPath = '';
-
-        console.log(
-          `Found ${captureResult.candidates.length} possible transcript response` +
-            `${captureResult.candidates.length === 1 ? '' : 's'}.`,
-        );
-        console.log(
-          `Parsed ${captureResult.transcriptMatchCount || 0} transcript match` +
-            `${captureResult.transcriptMatchCount === 1 ? '' : 'es'}.`,
-        );
-
-        if (!captureResult.matchedCandidate) {
-          if (options.debug) {
-            const networkCapturePayload = buildNetworkCapturePayload({
-              options,
-              browser,
-              profile,
-              debugPort,
-              targetPage,
-              captureResult,
-            });
-            networkOutputPath = saveNetworkCaptureOutput(
-              networkCapturePayload,
-              outputBasePath,
-            );
-            console.log(`Saved diagnostic capture: ${networkOutputPath}`);
-          }
-
-          throw new CliError(
-            buildMissingTranscriptCaptureMessage(
-              captureResult,
-              options.debug,
-              captureControl,
-            ),
-          );
-        }
-
-        if (options.debug) {
-          const networkCapturePayload = buildNetworkCapturePayload({
-            options,
-            browser,
-            profile,
-            debugPort,
-            targetPage,
-            captureResult,
-          });
-          networkOutputPath = saveNetworkCaptureOutput(
-            networkCapturePayload,
-            outputBasePath,
-          );
-        }
-
-        const entries = captureResult.matchedCandidate.parsedEntries;
-        const outputPayload = buildOutputPayload(metadata, entries);
-        const outputPaths = saveOutputs(
-          outputPayload,
-          outputBasePath,
-          options.outputFormat,
-        );
-
-        console.log(
-          `Matched transcript payload: ${captureResult.matchedCandidate.url}`,
-        );
-        console.log(`Parsed ${entries.length} transcript entries.`);
-        for (const outputPath of outputPaths) {
-          console.log(`Saved transcript file: ${outputPath}`);
-        }
-        if (networkOutputPath) {
-          console.log(`Saved diagnostic capture: ${networkOutputPath}`);
-        }
-
-        hasCompletedExtraction = true;
-        cdp.close();
-        cdp = null;
-        targetPage = null;
-      }
+      cdp = await connectToPage(targetPage.webSocketDebuggerUrl);
+      await extractTranscriptFromConnectedPage({
+        cdp,
+        prompt,
+        options,
+        browser,
+        profile,
+        debugPort,
+        targetPage,
+        captureControl,
+      });
 
       return 0;
     } catch (error) {
       return handleError(error);
     } finally {
       prompt.close();
-  
+
       if (cdp) {
         cdp.close();
       }
-  
+
       if (!options.keepBrowserOpen && browserProcess?.pid) {
         await shutdownBrowser(browserProcess, debugPort);
       }
-  
+
       if (options.keepBrowserOpen && tempDataDir) {
         console.log(
           `Temporary profile preserved because --keep-browser-open is set: ${tempDataDir}`,
@@ -7538,24 +9600,493 @@ const runEmbeddedNetworkMode = (() => {
     }
   }
 
-  return async function runEmbeddedNetworkMode(captureControl = 'manual') {
-    return run(captureControl);
+  async function runCrawler() {
+    const options = parseCrawlerArgs(process.argv.slice(2));
+
+    if (options.help) {
+      printCrawlerHelp();
+      return 0;
+    }
+
+    if (options.version) {
+      printVersion();
+      return 0;
+    }
+
+    ensureSupportedPlatform();
+
+    const prompt = createPrompt();
+    const stateFilePath = resolveCrawlerStatePath(options);
+    let browserProcess = null;
+    let cdp = null;
+    let tempDataDir = null;
+    let browser = null;
+    let profile = null;
+    let debugPort = null;
+    let targetPage = null;
+
+    try {
+      ({ browser, profile } = await selectBrowserAndProfile(options, prompt));
+      debugPort = await findAvailablePort(options.debugPort);
+
+      console.log(`\nUsing ${browser.name} / "${profile.displayName}".`);
+      await ensureBrowserIsClosed(prompt, browser);
+
+      tempDataDir = join(tmpdir(), `stream-transcript-extractor-crawl-${Date.now()}`);
+      mkdirSync(tempDataDir, { recursive: true });
+
+      console.log('Preparing temporary browser profile...');
+      prepareTempProfile(browser.basePath, profile, tempDataDir);
+
+      console.log(`Launching ${browser.name} on debug port ${debugPort}...`);
+      browserProcess = launchBrowser(browser, profile, tempDataDir, debugPort);
+
+      console.log('Waiting for the browser debug endpoint...');
+      await waitForBrowserDebugEndpoint(debugPort);
+      const pages = await waitForBrowserPageTarget(debugPort);
+      targetPage = pages[0];
+
+      if (!targetPage) {
+        throw new CliError('No browser page target is available for crawling.');
+      }
+
+      cdp = await connectToPage(targetPage.webSocketDebuggerUrl);
+      await cdp.send('Runtime.enable');
+
+      console.log(`Opening Stream: ${options.startUrl}`);
+      if (options.waitBeforeDiscoveryMs > 0) {
+        console.log(
+          `Waiting ${options.waitBeforeDiscoveryMs} ms on the Stream page so auth and page load can settle...`,
+        );
+      }
+
+      console.log('\nDiscovering meetings from Stream network payloads and the current page...');
+      const discovery = await discoverMeetingPages(cdp, options.startUrl, {
+        navigate: true,
+        waitBeforeDomDiscoveryMs: options.waitBeforeDiscoveryMs,
+        debugEnabled: options.debug,
+      });
+      const discoveredAt = new Date().toISOString();
+      const existingState = loadCrawlerState(stateFilePath);
+      const crawlItems = mergeCrawlerStateItems(
+        existingState.items,
+        discovery.items,
+        discoveredAt,
+      );
+      const crawlItemsByUrl = new Map(
+        crawlItems.map((item) => [item.url, item]),
+      );
+      let stateSummary = buildCrawlerStateSummary(crawlItems);
+
+      function persistCrawlerState(updatedAt) {
+        stateSummary = buildCrawlerStateSummary(crawlItems);
+        saveCrawlerStateOutput(
+          buildCrawlerStatePayload({
+            options,
+            browser,
+            profile,
+            stateFilePath,
+            items: crawlItems,
+            updatedAt,
+          }),
+          stateFilePath,
+        );
+      }
+
+      persistCrawlerState(discoveredAt);
+
+      if (options.debug) {
+        const discoveryDebugPath = saveCrawlerDiscoveryDebugOutput(
+          buildCrawlerDiscoveryDebugPayload({
+            options,
+            browser,
+            profile,
+            discovery,
+            stateFilePath,
+            discoveredAt,
+          }),
+          stateFilePath,
+        );
+        console.log(`Discovery debug file: ${discoveryDebugPath}`);
+      }
+
+      console.log(
+        `Selected Meetings filter "${discovery.meetingsControlLabel || 'Meetings'}".`,
+      );
+      console.log(
+        `Scrolled ${discovery.scrollIterations} time` +
+          `${discovery.scrollIterations === 1 ? '' : 's'} and discovered ` +
+          `${discovery.items.length} meeting page` +
+          `${discovery.items.length === 1 ? '' : 's'}.`,
+      );
+      console.log(
+        `Discovery sources: ${discovery.domItemCount} DOM item` +
+          `${discovery.domItemCount === 1 ? '' : 's'}, ` +
+          `${discovery.networkItemCount} network match` +
+          `${discovery.networkItemCount === 1 ? '' : 'es'}.`,
+      );
+      if (Number(discovery.graphResolvedItemCount || 0) > 0) {
+        console.log(
+          `Network fallback resolved ${discovery.graphResolvedItemCount} item` +
+            `${discovery.graphResolvedItemCount === 1 ? '' : 's'} via Microsoft Graph ` +
+            `(${discovery.graphThumbnailResolvedItemCount || 0} from thumbnail traffic, ` +
+            `${discovery.domGraphResolvedItemCount || 0} from card metadata).`,
+        );
+      }
+      if (
+        typeof discovery.visibleCardCount === 'number'
+          ? discovery.visibleCardCount > 0
+          : Array.isArray(discovery.visibleCardTitles) &&
+            discovery.visibleCardTitles.length > 0
+      ) {
+        console.log(
+          `Visible meeting cards in the rendered list: ${
+            typeof discovery.visibleCardCount === 'number'
+              ? discovery.visibleCardCount
+              : discovery.visibleCardTitles.length
+          }.`,
+        );
+      }
+      console.log(
+        `Tracked ${discovery.trackedResponseCount} discovery response` +
+          `${discovery.trackedResponseCount === 1 ? '' : 's'}.`,
+      );
+      console.log(`Queue state file: ${stateFilePath}`);
+      console.log(
+        `Queue status: ${stateSummary.newItemCount} new, ` +
+          `${stateSummary.pendingItemCount} pending, ` +
+          `${stateSummary.failedItemCount} failed, ` +
+          `${stateSummary.successItemCount} done.`,
+      );
+
+      if (crawlItems.length === 0) {
+        throw new CliError(
+          'No meeting pages were discovered from the Stream Meetings view.',
+        );
+      }
+      if (discovery.items.length === 0) {
+        console.log(
+          'No current meetings were discovered in this run. Using the saved crawl queue instead.',
+        );
+      }
+
+      let selection;
+      if (options.selectionSpec) {
+        let indexes;
+        try {
+          indexes = resolveCrawlerSelectionIndexes(
+            options.selectionSpec,
+            crawlItems,
+          );
+        } catch (error) {
+          if (
+            error instanceof CliError &&
+            String(error.message || '').startsWith('No ')
+          ) {
+            console.log(error.message);
+            return 0;
+          }
+          throw error;
+        }
+        selection = {
+          indexes,
+          items: indexes.map((index) => crawlItems[index]),
+        };
+        console.log(
+          `Selection "${options.selectionSpec}" matched ` +
+            `${selection.items.length} queue item` +
+            `${selection.items.length === 1 ? '' : 's'}.`,
+        );
+      } else {
+        selection = await chooseManyFromList(
+          prompt,
+          'Crawler queue',
+          crawlItems,
+          buildDiscoveredMeetingLabel,
+          '\nSelect meetings to extract (Enter = pending queue; or use 1-5, new, failed, done, all): ',
+          {
+            resolveSelection: resolveCrawlerSelectionIndexes,
+          },
+        );
+      }
+      const selectedItems = selection.items;
+      if (selectedItems.length === 0) {
+        console.log('No crawl items matched the requested selection.');
+        return 0;
+      }
+      const selectedAt = new Date().toISOString();
+      for (const item of selectedItems) {
+        const stateItem = crawlItemsByUrl.get(item.url);
+        if (stateItem) {
+          updateCrawlerStateItem(stateItem, {
+            lastSelectedAt: selectedAt,
+          });
+        }
+      }
+      persistCrawlerState(selectedAt);
+      const itemOptions = {
+        ...options,
+        outputName: '',
+      };
+      const startedAt = new Date().toISOString();
+      const results = [];
+
+      console.log(
+        `\nStarting batch extraction for ${selectedItems.length} meeting` +
+          `${selectedItems.length === 1 ? '' : 's'}.`,
+      );
+      console.log(
+        'Reusing the same browser debug session for discovery and all extraction attempts.',
+      );
+
+      for (let index = 0; index < selectedItems.length; index += 1) {
+        const selectedItem = selectedItems[index];
+        const stateItem = crawlItemsByUrl.get(selectedItem.url);
+        console.log(
+          `\n[${index + 1}/${selectedItems.length}] ` +
+            `${selectedItem.title || selectedItem.url}`,
+        );
+
+        const attemptStartedAt = new Date().toISOString();
+        if (stateItem) {
+          updateCrawlerStateItem(stateItem, {
+            lastSelectedAt: attemptStartedAt,
+            lastAttemptedAt: attemptStartedAt,
+          });
+          persistCrawlerState(attemptStartedAt);
+        }
+
+        try {
+          const candidateTargetUrls = buildCrawlerExtractionTargetUrls(selectedItem);
+          let extractionResult = null;
+          let extractionTargetUrl = '';
+          let extractionPageSnapshot = null;
+          let lastExtractionError = null;
+
+          for (
+            let candidateIndex = 0;
+            candidateIndex < candidateTargetUrls.length;
+            candidateIndex += 1
+          ) {
+            const candidateTargetUrl = candidateTargetUrls[candidateIndex];
+            console.log(
+              `Trying playback URL ${candidateIndex + 1}/${candidateTargetUrls.length}: ${candidateTargetUrl}`,
+            );
+
+            const pageSnapshot = await navigatePageAndWait(cdp, candidateTargetUrl);
+            if (isClearlyWrongMeetingLandingPage(pageSnapshot, candidateTargetUrl)) {
+              lastExtractionError = new CliError(
+                `Navigation landed on an unexpected page instead of the meeting recording: ` +
+                  `${pageSnapshot.title || pageSnapshot.url || candidateTargetUrl}`,
+              );
+              console.log(
+                `Skipping URL because it landed on "${pageSnapshot.title || pageSnapshot.url}".`,
+              );
+              continue;
+            }
+
+            const currentTargetPage = {
+              ...targetPage,
+              title:
+                pageSnapshot.title || selectedItem.title || targetPage.title,
+              url: pageSnapshot.url || candidateTargetUrl,
+            };
+
+            try {
+              extractionResult = await extractTranscriptFromConnectedPage({
+                cdp,
+                prompt,
+                options: itemOptions,
+                browser,
+                profile,
+                debugPort,
+                targetPage: currentTargetPage,
+                captureControl: 'automatic',
+                allowManualAssist: false,
+              });
+              extractionTargetUrl = candidateTargetUrl;
+              extractionPageSnapshot = pageSnapshot;
+              break;
+            } catch (error) {
+              lastExtractionError = error;
+              if (candidateIndex < candidateTargetUrls.length - 1) {
+                console.log(
+                  `Extraction did not succeed from this URL. Trying the next candidate...`,
+                );
+              }
+            }
+          }
+
+          if (!extractionResult) {
+            throw (
+              lastExtractionError ||
+              new CliError(
+                'No usable playback URL produced a transcript for this meeting.',
+              )
+            );
+          }
+
+          results.push({
+            index: index + 1,
+            title: extractionResult.metadata.title || selectedItem.title,
+            url: selectedItem.url,
+            extractionTargetUrl:
+              extractionTargetUrl || extractionPageSnapshot?.url || selectedItem.url,
+            status: 'success',
+            entryCount: extractionResult.entryCount,
+            matchedCandidateUrl: extractionResult.matchedCandidateUrl,
+            outputPaths: extractionResult.outputPaths,
+            networkOutputPath: extractionResult.networkOutputPath,
+            captureSummary: extractionResult.captureSummary,
+          });
+
+          if (stateItem) {
+            updateCrawlerStateItem(stateItem, {
+              title:
+                extractionResult.metadata.title ||
+                selectedItem.title ||
+                stateItem.title,
+              lastStatus: 'success',
+              attemptCount: stateItem.attemptCount + 1,
+              successCount: stateItem.successCount + 1,
+              lastSucceededAt: new Date().toISOString(),
+              lastError: '',
+              lastEntryCount: extractionResult.entryCount,
+              lastMatchedCandidateUrl: extractionResult.matchedCandidateUrl,
+              outputPaths: extractionResult.outputPaths,
+              networkOutputPath: extractionResult.networkOutputPath,
+              candidateUrls: candidateTargetUrls,
+              isNewThisRun: false,
+            });
+            persistCrawlerState(new Date().toISOString());
+          }
+        } catch (error) {
+          const message =
+            error instanceof Error ? error.message : 'Unknown extraction failure.';
+          console.error(`\nItem failed: ${message}`);
+          results.push({
+            index: index + 1,
+            title: selectedItem.title,
+            url: selectedItem.url,
+            extractionTargetUrl: '',
+            status: 'failed',
+            entryCount: 0,
+            matchedCandidateUrl: '',
+            outputPaths: [],
+            networkOutputPath: error?.details?.networkOutputPath || '',
+            captureSummary: null,
+            error: message,
+          });
+
+          if (stateItem) {
+            updateCrawlerStateItem(stateItem, {
+              lastStatus: 'failed',
+              attemptCount: stateItem.attemptCount + 1,
+              failureCount: stateItem.failureCount + 1,
+              lastFailedAt: new Date().toISOString(),
+              lastError: message,
+              lastEntryCount: stateItem.lastEntryCount,
+              lastMatchedCandidateUrl: '',
+              outputPaths: stateItem.outputPaths,
+              networkOutputPath:
+                error?.details?.networkOutputPath || stateItem.networkOutputPath,
+              isNewThisRun: false,
+            });
+            persistCrawlerState(new Date().toISOString());
+          }
+        }
+      }
+
+      const completedAt = new Date().toISOString();
+      persistCrawlerState(completedAt);
+      const batchStatusPayload = buildBatchStatusPayload({
+        options,
+        browser,
+        profile,
+        discovery,
+        results,
+        startedAt,
+        completedAt,
+        stateFilePath,
+        stateSummary,
+      });
+      const batchStatusPath = saveBatchStatusOutput(
+        batchStatusPayload,
+        buildOutputBasePath('crawl', options.outputName, options.outputDir),
+      );
+      const successCount = results.filter((result) => result.status === 'success').length;
+      const failureCount = results.length - successCount;
+
+      console.log('\nBatch summary:');
+      console.log(`Successful items: ${successCount}`);
+      console.log(`Failed items: ${failureCount}`);
+      console.log(
+        `Queue after run: ${stateSummary.newItemCount} new, ` +
+          `${stateSummary.pendingItemCount} pending, ` +
+          `${stateSummary.failedItemCount} failed, ` +
+          `${stateSummary.successItemCount} done.`,
+      );
+      console.log(`Updated crawl state: ${stateFilePath}`);
+      console.log(`Saved batch status to: ${batchStatusPath}`);
+
+      return failureCount === 0 ? 0 : 1;
+    } catch (error) {
+      return handleError(error);
+    } finally {
+      prompt.close();
+
+      if (cdp) {
+        cdp.close();
+      }
+
+      if (!options.keepBrowserOpen && browserProcess?.pid) {
+        await shutdownBrowser(browserProcess, debugPort);
+      }
+
+      if (options.keepBrowserOpen && tempDataDir) {
+        console.log(
+          `Temporary profile preserved because --keep-browser-open is set: ${tempDataDir}`,
+        );
+      } else if (tempDataDir) {
+        try {
+          rmSync(tempDataDir, { recursive: true, force: true });
+        } catch {
+          // Ignore cleanup failures.
+        }
+      }
+    }
+  }
+
+  return {
+    runEmbeddedNetworkMode: async (captureControl = 'manual') => run(captureControl),
+    runCrawler,
+    parseSelectionSpec,
+    mergeDiscoveredMeetingItems,
   };
 })();
 
-async function runSelectedMode() {
-  const rawArgs = process.argv.slice(2);
-  let { mode, forwardedArgs } = resolveExtractorMode(rawArgs);
+async function runSelectedWorkflow() {
+  const originalArgv = [...process.argv];
+  let rawArgv = process.argv.slice(2);
 
-  if (shouldUseGuidedSetup(rawArgs)) {
-    ({ mode, forwardedArgs } = await runGuidedSetup());
+  if (isInteractiveEntrypointLaunch(rawArgv)) {
+    rawArgv = await promptForInteractiveLaunchArgs();
   }
 
-  const originalArgv = [...process.argv];
+  const { workflow, mode, modeProvided, forwardedArgs } = resolveWorkflowSelection(
+    rawArgv,
+  );
   process.argv = [originalArgv[0], originalArgv[1], ...forwardedArgs];
 
   try {
-    if (forwardedArgs.includes('--help') || forwardedArgs.includes('-h')) {
+    if (workflow === 'crawl') {
+      return await networkModeRuntime.runCrawler();
+    }
+
+    if (
+      !modeProvided &&
+      (forwardedArgs.includes('--help') || forwardedArgs.includes('-h'))
+    ) {
       printEntrypointHelp();
       return 0;
     }
@@ -7570,21 +10101,39 @@ async function runSelectedMode() {
     }
 
     if (mode === 'automatic') {
-      return await runEmbeddedNetworkMode('automatic');
+      return await networkModeRuntime.runEmbeddedNetworkMode('automatic');
     }
 
-    return await runEmbeddedNetworkMode('manual');
+    return await networkModeRuntime.runEmbeddedNetworkMode('manual');
   } finally {
     process.argv = originalArgv;
   }
 }
 
-let exitCode = 0;
-
-try {
-  exitCode = await runSelectedMode();
-} catch (error) {
-  exitCode = handleEntrypointError(error);
+export async function runExtractCli() {
+  return runSelectedWorkflow();
 }
 
-process.exitCode = exitCode;
+export async function runCrawlerCli() {
+  return networkModeRuntime.runCrawler();
+}
+
+export function parseCrawlerSelectionSpec(value, itemCount) {
+  return networkModeRuntime.parseSelectionSpec(value, itemCount);
+}
+
+export function mergeCrawlerDiscoveryItems(networkItems, domItems) {
+  return networkModeRuntime.mergeDiscoveredMeetingItems(networkItems, domItems);
+}
+
+if (import.meta.main) {
+  let exitCode = 0;
+
+  try {
+    exitCode = await runSelectedWorkflow();
+  } catch (error) {
+    exitCode = handleEntrypointError(error);
+  }
+
+  process.exitCode = exitCode;
+}

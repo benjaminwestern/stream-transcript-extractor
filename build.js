@@ -2,25 +2,29 @@
 
 import { mkdirSync, statSync } from 'node:fs';
 
-const SOURCE_ENTRYPOINT = './extract.js';
 const DIST_DIR = 'dist';
 const DEFAULT_BUILD_VERSION = '0.0.0-dev';
+const BINARY = Object.freeze({
+  name: 'extractor',
+  entrypoint: './extract.js',
+  baseName: 'stream-transcript-extractor',
+});
 
 const TARGETS = Object.freeze([
   {
     name: 'macos-arm64',
     target: 'bun-darwin-arm64',
-    outfile: `${DIST_DIR}/stream-transcript-extractor-macos-arm64`,
+    suffix: 'macos-arm64',
   },
   {
     name: 'macos-x64',
     target: 'bun-darwin-x64',
-    outfile: `${DIST_DIR}/stream-transcript-extractor-macos-x64`,
+    suffix: 'macos-x64',
   },
   {
     name: 'windows-x64',
     target: 'bun-windows-x64-baseline',
-    outfile: `${DIST_DIR}/stream-transcript-extractor-windows-x64.exe`,
+    suffix: 'windows-x64.exe',
   },
 ]);
 
@@ -57,6 +61,11 @@ function printHelp() {
   console.log('Targets:');
   console.log(`  ${targetNames}`);
   console.log('');
+  console.log('Binary:');
+  console.log(`  ${BINARY.baseName}`);
+  console.log('  Run the interactive launcher with: <binary>');
+  console.log('  Run crawl with: <binary> crawl [options]');
+  console.log('');
   console.log('Environment:');
   console.log(
     `  BUILD_VERSION  Override the embedded version (default: ${DEFAULT_BUILD_VERSION}).`,
@@ -90,17 +99,18 @@ async function main() {
 
   mkdirSync(DIST_DIR, { recursive: true });
 
-  console.log(`Building ${selectedTargets.length} target(s)...`);
+  console.log(`Building ${selectedTargets.length} binary target(s)...`);
 
   for (const buildTarget of selectedTargets) {
     console.log(`\n- ${buildTarget.name} (${buildTarget.target})`);
 
+    const outfile = `${DIST_DIR}/${BINARY.baseName}-${buildTarget.suffix}`;
     const result = await Bun.build({
-      entrypoints: [SOURCE_ENTRYPOINT],
+      entrypoints: [BINARY.entrypoint],
       minify: true,
       compile: {
         target: buildTarget.target,
-        outfile: buildTarget.outfile,
+        outfile,
       },
       define: {
         __BUILD_VERSION__: JSON.stringify(buildVersion),
@@ -109,7 +119,7 @@ async function main() {
     });
 
     if (!result.success) {
-      console.error(`Build failed for ${buildTarget.name}.`);
+      console.error(`Build failed for ${BINARY.name} / ${buildTarget.name}.`);
       for (const log of result.logs) {
         console.error(log.message);
       }
@@ -117,8 +127,8 @@ async function main() {
       return;
     }
 
-    const fileSize = statSync(buildTarget.outfile).size;
-    console.log(`  Created ${buildTarget.outfile} (${formatBytes(fileSize)})`);
+    const fileSize = statSync(outfile).size;
+    console.log(`  Created ${outfile} (${formatBytes(fileSize)})`);
   }
 }
 
