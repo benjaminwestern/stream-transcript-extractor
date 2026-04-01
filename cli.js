@@ -1,5 +1,7 @@
 #!/usr/bin/env bun
 
+import { spawnSync } from 'node:child_process';
+import { dirname } from 'node:path';
 import { printHelpScreen } from './lib/cli.js';
 import {
   APP_DESCRIPTION,
@@ -10,6 +12,8 @@ import {
   DEFAULT_EXTRACTOR_MODE,
   DEFAULT_TRANSCRIPT_OUTPUT_FORMAT,
   DEFAULT_WORKFLOW,
+  IS_MACOS,
+  IS_WINDOWS,
   SUPPORTED_EXTRACTOR_MODES,
   SUPPORTED_WORKFLOWS,
 } from './lib/extractor-config.js';
@@ -21,6 +25,7 @@ import {
 } from './lib/network-mode-runtime.js';
 
 const { createPrompt, chooseFromList } = createCliRuntime({ appName: APP_NAME });
+const TERMINAL_HANDOFF_ENV = 'STREAM_TRANSCRIPT_EXTRACTOR_TERMINAL_HANDOFF';
 
 function readOptionValue(flag, inlineValue, nextArg) {
   const value = inlineValue ?? nextArg;
@@ -223,6 +228,87 @@ function isInteractiveEntrypointLaunch(argv) {
     Boolean(process.stdin.isTTY) &&
     Boolean(process.stdout.isTTY)
   );
+}
+
+function isCompiledBinaryEntrypoint() {
+  const entrypoint = String(process.argv[1] || '').trim().toLowerCase();
+  return Boolean(
+    entrypoint &&
+      !entrypoint.endsWith('.js') &&
+      !entrypoint.endsWith('.mjs') &&
+      !entrypoint.endsWith('.cjs'),
+  );
+}
+
+function escapeShellArg(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function escapeAppleScriptString(value) {
+  return String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+function quoteWindowsCmdArg(value) {
+  return `"${String(value).replace(/"/g, '""')}"`;
+}
+
+function handoffBinaryLaunchToMacTerminal(binaryPath) {
+  const command = [
+    `cd ${escapeShellArg(dirname(binaryPath))}`,
+    `${TERMINAL_HANDOFF_ENV}=1 ${escapeShellArg(binaryPath)}`,
+  ].join('; ');
+  const appleScript = [
+    'tell application "Terminal"',
+    'activate',
+    `do script "${escapeAppleScriptString(command)}"`,
+    'end tell',
+  ].join('\n');
+
+  return spawnSync('/usr/bin/osascript', ['-e', appleScript], {
+    stdio: 'ignore',
+  }).status;
+}
+
+function handoffBinaryLaunchToWindowsConsole(binaryPath) {
+  const command = [
+    `set ${TERMINAL_HANDOFF_ENV}=1`,
+    `start "" /d ${quoteWindowsCmdArg(dirname(binaryPath))} ${quoteWindowsCmdArg(binaryPath)}`,
+  ].join(' && ');
+
+  return spawnSync(process.env.ComSpec || 'cmd.exe', ['/d', '/c', command], {
+    stdio: 'ignore',
+  }).status;
+}
+
+function handleNoTtyBinaryLaunch(argv) {
+  if (
+    (!IS_MACOS && !IS_WINDOWS) ||
+    !Array.isArray(argv) ||
+    argv.length > 0 ||
+    process.env[TERMINAL_HANDOFF_ENV] === '1' ||
+    isInteractiveEntrypointLaunch(argv) ||
+    !isCompiledBinaryEntrypoint()
+  ) {
+    return null;
+  }
+
+  const binaryPath = String(process.argv[1] || process.execPath || '').trim();
+  if (!binaryPath) {
+    return null;
+  }
+
+  const handoffStatus = IS_MACOS
+    ? handoffBinaryLaunchToMacTerminal(binaryPath)
+    : handoffBinaryLaunchToWindowsConsole(binaryPath);
+
+  if (handoffStatus === 0) {
+    return 0;
+  }
+
+  console.error(
+    'This binary needs a terminal window. Run it from Terminal and try again.',
+  );
+  return 1;
 }
 
 function renderInteractiveMenuChoice(choice) {
@@ -553,6 +639,11 @@ function handleEntrypointError(error) {
 
 async function runSelectedWorkflow(argv = process.argv.slice(2)) {
   let rawArgv = [...argv];
+  const noTtyLaunchResult = handleNoTtyBinaryLaunch(rawArgv);
+
+  if (noTtyLaunchResult != null) {
+    return noTtyLaunchResult;
+  }
 
   if (isInteractiveEntrypointLaunch(rawArgv)) {
     rawArgv = await promptForInteractiveLaunchArgs();
