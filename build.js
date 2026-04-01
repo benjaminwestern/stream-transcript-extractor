@@ -6,7 +6,7 @@ const DIST_DIR = 'dist';
 const DEFAULT_BUILD_VERSION = '0.0.0-dev';
 const BINARY = Object.freeze({
   name: 'extractor',
-  entrypoint: './extract.js',
+  entrypoint: './cli.js',
   baseName: 'stream-transcript-extractor',
 });
 
@@ -54,6 +54,10 @@ function printHelp() {
 
   console.log('Stream Transcript Extractor build script');
   console.log('');
+  console.log(
+    'Build standalone binaries for macOS and Windows from the source entrypoint.',
+  );
+  console.log('');
   console.log('Usage:');
   console.log('  bun ./build.js');
   console.log('  bun ./build.js <target> [<target> ...]');
@@ -61,8 +65,14 @@ function printHelp() {
   console.log('Targets:');
   console.log(`  ${targetNames}`);
   console.log('');
-  console.log('Binary:');
-  console.log(`  ${BINARY.baseName}`);
+  console.log('Artifacts:');
+  console.log(`  dist/${BINARY.baseName}-macos-arm64`);
+  console.log(`  dist/${BINARY.baseName}-macos-x64`);
+  console.log(`  dist/${BINARY.baseName}-windows-x64.exe`);
+  console.log('');
+  console.log('Notes:');
+  console.log('  The build output is a standalone executable for each target.');
+  console.log('  This script does not create DMG files or installer packages.');
   console.log('  Run the interactive launcher with: <binary>');
   console.log('  Run crawl with: <binary> crawl [options]');
   console.log('');

@@ -17,33 +17,40 @@ This repository is designed around three outcomes:
 
 ![Overview](assets/header-overview.svg)
 
-The runtime surface stays intentionally small. [`extract.js`](./extract.js)
-holds the Stream-specific extractor runtime and workflow routing,
-[`lib/cli.js`](./lib/cli.js) holds the shared CLI parsing, help, and
-terminal-selection logic, [`lib/cdp.js`](./lib/cdp.js)
-holds the reusable browser session and navigation helpers, and
-[`lib/network-capture.js`](./lib/network-capture.js) holds the reusable
-response-body capture helpers. [`build.js`](./build.js) builds release
-binaries, [`assets/`](./assets) holds the architecture diagram and generated
-README graphics, and [`scripts/`](./scripts) is the source of truth for those
-graphics and README validation.
+The runtime surface stays intentionally small at the entrypoint and explicit
+in the implementation. [`cli.js`](./cli.js) is the single public CLI
+entrypoint and workflow router. The implementation now lives in focused
+modules under [`lib/`](./lib), including shared CLI/runtime wiring in
+[`lib/cli.js`](./lib/cli.js) and
+[`lib/extractor-cli-runtime.js`](./lib/extractor-cli-runtime.js), browser
+launch and attachment helpers in [`lib/browser-session.js`](./lib/browser-session.js)
+and [`lib/cdp.js`](./lib/cdp.js), crawl and batch extraction flow in
+[`lib/network-mode-runtime.js`](./lib/network-mode-runtime.js) and
+[`lib/crawl-state.js`](./lib/crawl-state.js), and transcript capture and
+output helpers such as
+[`lib/connected-session-extraction.js`](./lib/connected-session-extraction.js),
+[`lib/transcript-network.js`](./lib/transcript-network.js), and
+[`lib/transcript-output.js`](./lib/transcript-output.js). [`build.js`](./build.js)
+builds release binaries, [`assets/`](./assets) holds the architecture diagram
+and generated README graphics, and [`scripts/`](./scripts) is the source of
+truth for those graphics and README validation.
 
 The project supports two operator flows:
 
-- `extract.js` is the single-meeting workflow. It supports three capture
+- `cli.js` is the single-meeting workflow. It supports three capture
   modes.
-- `extract.js crawl` opens Stream home, switches to **Meetings**, scrolls the
+- `cli.js crawl` opens Stream home, switches to **Meetings**, scrolls the
   full list, merges newly discovered items into a persistent crawl state file,
   lets you select items in the terminal with progress-aware labels, and
   reuses the same browser session to run the `automatic` extractor for each
   selected meeting.
 
-The help surface now follows the workflow too. `bun ./extract.js --help`
-shows the top-level map, `bun ./extract.js --mode automatic --help` shows the
-single-meeting network workflow, and `bun ./extract.js crawl --help` shows
+The help surface now follows the workflow too. `bun ./cli.js --help`
+shows the top-level map, `bun ./cli.js --mode automatic --help` shows the
+single-meeting network workflow, and `bun ./cli.js crawl --help` shows
 the batch discovery, queue state, and selection flow.
 
-When you launch `bun ./extract.js` with no arguments in a real terminal, it
+When you launch `bun ./cli.js` with no arguments in a real terminal, it
 opens the same interactive launcher that the compiled binary uses. That
 launcher lets you choose `extract` or `crawl`, then set the recommended
 workflow options before the run starts.
@@ -105,10 +112,10 @@ Run from source:
 
 ```bash
 mise install
-bun ./extract.js
-bun ./extract.js --help
-bun ./extract.js --mode automatic --help
-bun ./extract.js crawl --help
+bun ./cli.js
+bun ./cli.js --help
+bun ./cli.js --mode automatic --help
+bun ./cli.js crawl --help
 ```
 
 Run from a release binary:
@@ -132,40 +139,40 @@ These commands cover the common operator paths:
 
 ```bash
 # Recommended interactive launcher path
-bun ./extract.js
+bun ./cli.js
 
 # Recommended direct single-meeting path
-bun ./extract.js --mode automatic
+bun ./cli.js --mode automatic
 
 # Force a mode
-bun ./extract.js --mode network
-bun ./extract.js --mode dom
+bun ./cli.js --mode network
+bun ./cli.js --mode dom
 
 # Pick a browser or profile
-bun ./extract.js --browser chrome --profile Work
-bun ./extract.js --browser edge --profile "user@example.com"
+bun ./cli.js --browser chrome --profile Work
+bun ./cli.js --browser edge --profile "user@example.com"
 
 # Choose output
-bun ./extract.js --format md --output weekly-standup
-bun ./extract.js --format both --output weekly-standup
+bun ./cli.js --format md --output weekly-standup
+bun ./cli.js --format both --output weekly-standup
 
 # Diagnostics only when needed
-bun ./extract.js --output-dir ./exports --debug
+bun ./cli.js --output-dir ./exports --debug
 
 # Crawl Meetings and batch-extract selected items
-bun ./extract.js crawl
-bun ./extract.js crawl --browser chrome --profile Work
-bun ./extract.js crawl --output-dir ./exports --format md
-bun ./extract.js crawl --output-dir ./exports --format both
-bun ./extract.js crawl --debug
-bun ./extract.js crawl --state-file ./exports/team.state.json
-bun ./extract.js crawl --wait-before-discovery-ms 10000
-bun ./extract.js crawl --select pending --browser edge
+bun ./cli.js crawl
+bun ./cli.js crawl --browser chrome --profile Work
+bun ./cli.js crawl --output-dir ./exports --format md
+bun ./cli.js crawl --output-dir ./exports --format both
+bun ./cli.js crawl --debug
+bun ./cli.js crawl --state-file ./exports/team.state.json
+bun ./cli.js crawl --wait-before-discovery-ms 10000
+bun ./cli.js crawl --select pending --browser edge
 
 # Show help or version
-bun ./extract.js --help
-bun ./extract.js --version
-bun ./extract.js crawl --help
+bun ./cli.js --help
+bun ./cli.js --version
+bun ./cli.js crawl --help
 ```
 
 The extract workflow CLI options are:
@@ -349,29 +356,17 @@ the rendered asset lives in
 
 Three design decisions matter most:
 
-- The shared extraction runtime and workflow routing live in
-  [`extract.js`](./extract.js), so the batch flow reuses the same code paths
-  instead of forking them behind a second entrypoint.
-- Generic browser-session and network-capture plumbing live in
-  [`lib/cdp.js`](./lib/cdp.js) and
-  [`lib/network-capture.js`](./lib/network-capture.js), while Stream-specific
-  scoring, parsing, and extraction policy stay in [`extract.js`](./extract.js).
+- [`cli.js`](./cli.js) stays thin. It routes between `extract` and `crawl`,
+  while the real implementation lives in focused runtime modules under
+  [`lib/`](./lib).
+- Browser/session management, crawl discovery/state, transcript capture, and
+  transcript rendering are split into separate modules, so the batch flow and
+  single-meeting flow reuse the same lower-level code instead of carrying
+  duplicated runtimes.
 - The extractor uses your existing signed-in browser profile instead of asking
   for credentials or app registrations.
-- The `network` path is preferred because Stream's transcript UI is virtualized
-  and more likely to drift than the underlying payload transport.
-
-## Roadmap
-
-The near-term roadmap stays scoped to the same meeting-page workflow. The goal
-is to extend what the current browser session can do without growing a second
-separate capture stack.
-
-- TODO: Add optional MP4 download support to the crawl workflow so the
-  selected meeting can save its recording while the browser is already on the
-  Stream item page.
-
----
+- The network-backed path is preferred because Stream's transcript UI is
+  virtualized and more likely to drift than the underlying payload transport.
 
 ![Scripts and assets](assets/header-scripts.svg)
 
@@ -384,9 +379,9 @@ Repository script surface:
 
 | Command | Purpose |
 | --- | --- |
-| `bun ./extract.js --help` | Print the extractor CLI contract. |
-| `bun ./extract.js --mode automatic --help` | Print the mode-specific network capture workflow. |
-| `bun ./extract.js crawl --help` | Print the crawl workflow CLI contract. |
+| `bun ./cli.js --help` | Print the extractor CLI contract. |
+| `bun ./cli.js --mode automatic --help` | Print the mode-specific network capture workflow. |
+| `bun ./cli.js crawl --help` | Print the crawl workflow CLI contract. |
 | `bun ./build.js --help` | Print the standalone build contract. |
 | `python3 scripts/generate_assets.py` | Regenerate the README banner and section header SVG files. |
 | `python3 scripts/validate_readme.py` | Validate README asset references and local documentation links. |
@@ -413,9 +408,11 @@ commit the resulting assets together with the script change that produced them.
 
 ![Build](assets/header-build.svg)
 
-You can run the extractor directly from source, or you can compile a
-standalone binary with Bun. The built binary still requires Chrome or Edge on
-the target machine, but it does not require Bun or Node.js.
+You can run the extractor directly from source, or you can compile standalone
+binaries with Bun. The built artifacts still require Chrome or Edge on the
+target machine, but they do not require Bun or Node.js. The build script
+produces standalone executables in `dist/`; it does not produce DMG files or
+installer packages.
 
 Build from source:
 
@@ -439,6 +436,10 @@ Artifacts land in `dist/`:
 | `dist/stream-transcript-extractor-macos-arm64` | Apple Silicon Macs |
 | `dist/stream-transcript-extractor-macos-x64` | Intel Macs |
 | `dist/stream-transcript-extractor-windows-x64.exe` | Windows x64 |
+
+The macOS release artifact is the standalone executable itself. If you want
+to distribute it to other Macs, sign it and package it separately as part of
+your release process.
 
 Set `BUILD_VERSION` if you want a specific embedded version string:
 
@@ -534,23 +535,78 @@ stream-transcript-extractor/
 │   ├── header-overview.svg
 │   └── ...
 ├── build.js
-├── extract.js
+├── cli.js
 ├── lib/
+│   ├── browser-session.js
 │   ├── cdp.js
 │   ├── cli.js
-│   └── network-capture.js
+│   ├── connected-session-extraction.js
+│   ├── crawl-state.js
+│   ├── dom-mode-runtime.js
+│   ├── extractor-cli-runtime.js
+│   ├── network-capture.js
+│   ├── network-mode-runtime.js
+│   ├── transcript-network.js
+│   ├── transcript-output.js
+│   └── ...
 ├── mise.toml
 └── scripts/
     ├── generate_assets.py
     └── validate_readme.py
 ```
 
-[`extract.js`](./extract.js) remains the core runtime and CLI entrypoint for
-the Bun-based workflow. [`lib/cli.js`](./lib/cli.js) keeps the shared CLI
-surface in one place, [`lib/cdp.js`](./lib/cdp.js) keeps the reusable browser
-transport and navigation flow in one place, and
-[`lib/network-capture.js`](./lib/network-capture.js) keeps the reusable
-response-body helpers in one place. [`build.js`](./build.js),
+[`cli.js`](./cli.js) remains the only public source entrypoint. The `lib/`
+directory now carries the extracted runtime boundaries: browser attachment,
+workflow routing, crawl discovery/state, transcript capture, transcript
+rendering, and DOM automation. [`build.js`](./build.js),
 [`scripts/generate_assets.py`](./scripts/generate_assets.py), and
-[`scripts/validate_readme.py`](./scripts/validate_readme.py) keep the batch
-workflow, binary-release contract, and documentation contract explicit.
+[`scripts/validate_readme.py`](./scripts/validate_readme.py) keep the binary
+release contract and documentation contract explicit.
+
+---
+
+## FAQs
+
+The extractor is designed first around transcript access. The same signed-in
+browser session can often play the associated recording, but recording
+downloads are governed by a different set of permissions and transport rules.
+
+### Why doesn't the crawler promise reliable MP4 downloads?
+
+Current Microsoft Stream recordings are usually served through SharePoint's
+player stack rather than as a single stable public MP4 URL. In practice, the
+same recording can have all of the following behaviors depending on tenant
+policy, item permissions, and how the owner shared it:
+
+- The browser can play the recording, but SharePoint rejects direct file
+  download with `accessDenied`.
+- The page exposes a signed playback manifest and short-lived media URLs
+  instead of a reusable direct MP4 link.
+- The playback path uses encrypted DASH segments, so playback works in the
+  browser while a plain file fetch does not.
+
+Because of that, MP4 download support is not something this tool can promise
+for every crawl item, even when transcript extraction succeeds.
+
+### Can a signed-in browser session still help with recording downloads?
+
+Yes, but only on a best-effort basis. A signed-in Chrome or Edge session can
+sometimes expose a signed SharePoint download URL for the original file. When
+that happens, the recording may be downloadable. When it does not, the browser
+may still be able to play the recording through the Stream player without
+granting file-download rights.
+
+### Why aren't cookies enough?
+
+Cookies prove the browser session is signed in. They do not grant download
+rights that the current account does not already have, and they do not turn an
+encrypted playback manifest into a plain MP4 file. In other words, playback
+authorization and file-download authorization are related, but they are not
+the same thing.
+
+### What is the supported scope of this repository?
+
+The supported goal is reliable transcript extraction from a real signed-in
+browser profile. If a recording is also downloadable for the same account, a
+future helper can attempt to save it. The transcript workflow is the stable,
+supported path. MP4 download remains opportunistic rather than guaranteed.

@@ -21,7 +21,7 @@ GENERATED_ASSETS = [
 ]
 
 REQUIRED_PATHS = [
-    "extract.js",
+    "cli.js",
     "build.js",
     "mise.toml",
     "assets/extractor-architecture.d2",
