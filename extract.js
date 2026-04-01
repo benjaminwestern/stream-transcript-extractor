@@ -3365,6 +3365,51 @@ const runEmbeddedNetworkMode = (() => {
       String(url || '').toLowerCase(),
     );
   }
+
+  function isDataUrl(url) {
+    return String(url || '').trim().toLowerCase().startsWith('data:');
+  }
+
+  function isStaticAssetResourceType(resourceType) {
+    return [
+      'Font',
+      'Image',
+      'Media',
+      'Stylesheet',
+      'Manifest',
+    ].includes(String(resourceType || ''));
+  }
+
+  function buildNetworkSignalHaystack({
+    url,
+    mimeType = '',
+    contentType = '',
+    contentDisposition = '',
+    resourceType = '',
+  }) {
+    const rawUrl = String(url || '');
+    let normalizedUrl = rawUrl.toLowerCase();
+
+    if (isDataUrl(rawUrl)) {
+      normalizedUrl = 'data:';
+    } else {
+      try {
+        const parsed = new URL(rawUrl);
+        normalizedUrl =
+          `${parsed.hostname}${parsed.pathname}${parsed.search}`.toLowerCase();
+      } catch {
+        normalizedUrl = rawUrl.toLowerCase();
+      }
+    }
+
+    return [
+      normalizedUrl,
+      String(mimeType || '').toLowerCase(),
+      String(contentType || '').toLowerCase(),
+      String(contentDisposition || '').toLowerCase(),
+      String(resourceType || '').toLowerCase(),
+    ].join(' ');
+  }
   
   function containsTranscriptSignal(value) {
     return /transcript|caption|subtitle|subtitles|utterance|speaker|speech|vtt|closedcaption/.test(
@@ -3500,6 +3545,11 @@ const runEmbeddedNetworkMode = (() => {
     const headers = lowerCaseHeaderMap(response?.headers);
     const contentType = String(headers['content-type'] || '').toLowerCase();
     const contentDisposition = String(headers['content-disposition'] || '').toLowerCase();
+
+    if (isDataUrl(url) || isStaticAssetResourceType(resourceType)) {
+      return false;
+    }
+
     const score = scoreNetworkResponse({
       url,
       mimeType,
@@ -3527,7 +3577,17 @@ const runEmbeddedNetworkMode = (() => {
     resourceType,
   }) {
     let score = 0;
-    const haystack = [url, mimeType, contentType, contentDisposition].join(' ');
+    const haystack = buildNetworkSignalHaystack({
+      url,
+      mimeType,
+      contentType,
+      contentDisposition,
+      resourceType,
+    });
+
+    if (isDataUrl(url) || isStaticAssetResourceType(resourceType)) {
+      return 0;
+    }
   
     if (['Fetch', 'XHR'].includes(resourceType)) {
       score += 2;
@@ -3555,15 +3615,79 @@ const runEmbeddedNetworkMode = (() => {
     resourceType,
     score,
   }) {
-    const haystack = [url, mimeType, contentType, resourceType]
-      .join(' ')
-      .toLowerCase();
+    if (isDataUrl(url) || isStaticAssetResourceType(resourceType)) {
+      return false;
+    }
+
+    const haystack = buildNetworkSignalHaystack({
+      url,
+      mimeType,
+      contentType,
+      resourceType,
+    });
 
     return (
       isEncryptedTranscriptUrl(url) ||
       containsTranscriptSignal(haystack) ||
       score >= LIVE_TRANSCRIPT_SIGNAL_SCORE
     );
+  }
+
+  function compareTrackedResponsePriority(left, right) {
+    const leftScore = Number(left?.score || 0);
+    const rightScore = Number(right?.score || 0);
+    if (leftScore !== rightScore) {
+      return leftScore - rightScore;
+    }
+
+    const leftFetchLike = ['Fetch', 'XHR'].includes(String(left?.resourceType || ''))
+      ? 1
+      : 0;
+    const rightFetchLike = ['Fetch', 'XHR'].includes(String(right?.resourceType || ''))
+      ? 1
+      : 0;
+    if (leftFetchLike !== rightFetchLike) {
+      return leftFetchLike - rightFetchLike;
+    }
+
+    return String(left?.url || '').length - String(right?.url || '').length;
+  }
+
+  function retainTrackedResponse(trackedResponses, responseRecord, maxTrackedResponses) {
+    if (trackedResponses.has(responseRecord.requestId)) {
+      trackedResponses.set(responseRecord.requestId, responseRecord);
+      return true;
+    }
+
+    if (trackedResponses.size < maxTrackedResponses) {
+      trackedResponses.set(responseRecord.requestId, responseRecord);
+      return true;
+    }
+
+    let lowestPriorityEntry = null;
+
+    for (const [requestId, candidate] of trackedResponses.entries()) {
+      if (
+        !lowestPriorityEntry ||
+        compareTrackedResponsePriority(candidate, lowestPriorityEntry.record) < 0
+      ) {
+        lowestPriorityEntry = {
+          requestId,
+          record: candidate,
+        };
+      }
+    }
+
+    if (
+      !lowestPriorityEntry ||
+      compareTrackedResponsePriority(responseRecord, lowestPriorityEntry.record) <= 0
+    ) {
+      return false;
+    }
+
+    trackedResponses.delete(lowestPriorityEntry.requestId);
+    trackedResponses.set(responseRecord.requestId, responseRecord);
+    return true;
   }
 
   function formatNetworkResponseForTerminal({
@@ -5766,9 +5890,7 @@ const runEmbeddedNetworkMode = (() => {
     }
   
     const stopResponseListener = cdp.on('Network.responseReceived', (params) => {
-      if (trackedResponses.size >= MAX_TRACKED_RESPONSES) {
-        // Continue recording extended debug traffic even after candidate capture is full.
-      } else if (shouldTrackNetworkResponse(params.response, params.type)) {
+      if (shouldTrackNetworkResponse(params.response, params.type)) {
         const headers = sanitizeHeaders(params.response.headers);
         const lowerHeaders = lowerCaseHeaderMap(params.response.headers);
         const requestId = String(params.requestId);
@@ -5784,7 +5906,7 @@ const runEmbeddedNetworkMode = (() => {
           resourceType,
         });
   
-        trackedResponses.set(requestId, {
+        retainTrackedResponse(trackedResponses, {
           requestId,
           url,
           status: params.response.status,
@@ -5792,7 +5914,7 @@ const runEmbeddedNetworkMode = (() => {
           resourceType,
           headers,
           score,
-        });
+        }, MAX_TRACKED_RESPONSES);
         captureFeedback.candidateResponseCount = trackedResponses.size;
 
         if (
