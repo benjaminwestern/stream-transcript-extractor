@@ -148,3 +148,12 @@ output/
 tmp-profile/
 *.tmp
 *.yaml
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

@@ -1,2 +1,11 @@
 [tools]
 bun = "latest"
+python = "latest"
+
+[tasks.generate-assets]
+description = "Regenerate the README banner and section header SVG assets"
+run = "python3 scripts/generate_assets.py"
+
+[tasks.validate-docs]
+description = "Validate README links and generated documentation assets"
+run = "python3 scripts/validate_readme.py"

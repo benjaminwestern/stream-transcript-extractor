@@ -1,0 +1,60 @@
+        <svg width="1200" height="360" viewBox="0 0 1200 360" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <pattern id="ledger" width="48" height="48" patternUnits="userSpaceOnUse">
+              <path d="M 48 0 L 0 0 0 48" fill="none" stroke="#D6C8B6" stroke-width="1" />
+            </pattern>
+            <clipPath id="frame-clip">
+              <rect width="1200" height="360" rx="28" />
+            </clipPath>
+            <style><![CDATA[
+              .badge { font-family: "JetBrainsMono Nerd Font", "Hack Nerd Font", "CaskaydiaMono Nerd Font", "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 13px; font-weight: 700; fill: #223039; }
+              .eyebrow { font-family: "JetBrainsMono Nerd Font", "Hack Nerd Font", "CaskaydiaMono Nerd Font", "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 15px; font-weight: 700; letter-spacing: 0.14em; fill: #C36A35; }
+              .title { font-family: "JetBrainsMono Nerd Font", "Hack Nerd Font", "CaskaydiaMono Nerd Font", "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 40px; font-weight: 700; fill: #FFF8EF; }
+              .subtitle { font-family: "JetBrainsMono Nerd Font", "Hack Nerd Font", "CaskaydiaMono Nerd Font", "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 18px; font-weight: 700; fill: #D8CEC0; }
+              .footer { font-family: "JetBrainsMono Nerd Font", "Hack Nerd Font", "CaskaydiaMono Nerd Font", "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 14px; font-weight: 700; fill: #223039; }
+              .panel-label { font-family: "JetBrainsMono Nerd Font", "Hack Nerd Font", "CaskaydiaMono Nerd Font", "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 12px; font-weight: 700; letter-spacing: 0.1em; fill: #C36A35; }
+              .panel-title { font-family: "JetBrainsMono Nerd Font", "Hack Nerd Font", "CaskaydiaMono Nerd Font", "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 16px; font-weight: 700; fill: #223039; }
+              .panel-copy { font-family: "JetBrainsMono Nerd Font", "Hack Nerd Font", "CaskaydiaMono Nerd Font", "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 15px; fill: #223039; }
+              .panel-copy-muted { font-family: "JetBrainsMono Nerd Font", "Hack Nerd Font", "CaskaydiaMono Nerd Font", "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 14px; fill: #2B3B46; }
+            ]]></style>
+          </defs>
+
+          <g clip-path="url(#frame-clip)">
+            <rect width="1200" height="360" rx="28" fill="#F3EEE6" />
+            <rect width="1200" height="360" rx="28" fill="url(#ledger)" opacity="0.72" />
+            <rect x="0" y="298" width="1200" height="62" fill="#FBF8F2" />
+
+            <rect x="50" y="42" width="724" height="250" rx="22" fill="#BDAE9B" />
+<rect x="42" y="34" width="724" height="250" rx="22" fill="#162028" stroke="#2F404A" stroke-width="2" />
+            <rect x="70" y="58" width="286" height="32" rx="9" fill="#F3EEE6" />
+            <text x="90" y="79" class="badge">&gt; stream-transcript-extractor</text>
+            <rect x="70" y="112" width="28" height="3" rx="1.5" fill="#C36A35" />
+            <text x="114" y="118" class="eyebrow">BROWSER-DRIVEN STREAM EXTRACTION</text>
+            <text x="70" y="168" class="title">Stream Transcript Extractor</text>
+            <text x="70" y="212" class="subtitle">browser-profile attach</text>
+            <text x="70" y="240" class="subtitle">network-first transcript capture</text>
+            <text x="70" y="268" class="subtitle">automatic panel recovery and DOM fallback</text>
+
+            <rect x="812" y="54" width="314" height="132" rx="18" fill="#BDAE9B" />
+<rect x="806" y="48" width="314" height="132" rx="18" fill="#FBF8F2" stroke="#D6C8B6" stroke-width="2" />
+            <text x="834" y="80" class="panel-label">[ modes ]</text>
+            <text x="834" y="106" class="panel-title">capture paths</text>
+            <text x="834" y="136" class="panel-copy">network  automatic  dom</text>
+            <text x="834" y="160" class="panel-copy-muted">payload first, UI fallback</text>
+
+            <rect x="812" y="194" width="314" height="136" rx="18" fill="#BDAE9B" />
+<rect x="806" y="188" width="314" height="136" rx="18" fill="#FBF8F2" stroke="#D6C8B6" stroke-width="2" />
+            <text x="834" y="220" class="panel-label">[ outputs ]</text>
+            <text x="834" y="246" class="panel-title">artifacts</text>
+            <text x="834" y="274" class="panel-copy">json  markdown</text>
+            <text x="834" y="296" class="panel-copy">.network.json</text>
+            <text x="834" y="318" class="panel-copy-muted">debug traces and release builds</text>
+
+            <rect x="786" y="60" width="10" height="216" rx="5" fill="#B8913C" />
+            <rect x="1144" y="62" width="16" height="16" rx="3" fill="#2F6E72" />
+            <rect x="1144" y="88" width="16" height="16" rx="3" fill="#C36A35" />
+            <rect x="1144" y="114" width="16" height="16" rx="3" fill="#4C6F94" />
+
+            <text x="70" y="334" class="footer">Chrome  •  Edge  •  Bun  •  network capture  •  automatic fallback  •  standalone builds</text>
+          </g>
+        </svg>
