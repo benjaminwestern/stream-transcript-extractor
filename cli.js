@@ -693,10 +693,10 @@ async function promptForInteractiveLaunchArgs() {
     );
 
     if (launchChoice.value === 'recommended') {
-      return promptForRecommendedLaunchArgs(prompt);
+      return await promptForRecommendedLaunchArgs(prompt);
     }
 
-    return promptForCustomLaunchArgs(prompt);
+    return await promptForCustomLaunchArgs(prompt);
   } finally {
     prompt.close();
   }
